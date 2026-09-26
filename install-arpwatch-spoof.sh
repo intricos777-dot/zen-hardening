@@ -21,17 +21,30 @@ PIDFILE=/run/arpwatch-spoof.pid
 LOG=/var/log/arpwatch-spoof.log
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Resolve the REAL user's home. Under sudo, $HOME is /root, so every path into
-# the user's own ~/Projects silently becomes /root/Projects/... and the script
-# reports the hook as missing. SUDO_USER names whoever actually invoked it.
-SUDO_USER_NAME="${SUDO_USER:-}"
-if [ -n "$SUDO_USER_NAME" ]; then
-    TARGET_HOME="$(getent passwd "$SUDO_USER_NAME" | cut -d: -f6)"
+# Resolve the REAL invoking user and their home. There are two separate traps:
+#
+#  1. Under sudo, $HOME is /root, so every path into the user's own ~/Projects
+#     silently becomes /root/Projects/... and the hook reads as missing.
+#  2. pkexec does NOT set SUDO_USER at all. A SUDO_USER-only script therefore
+#     resolves to root and installs units pointing at /run/user/0 and
+#     /root/Projects/... Those units stay broken on disk permanently, which is
+#     strictly worse than refusing to run.
+#
+# PKEXEC_UID is the reliable signal under pkexec. Never fall back to a
+# hardcoded account name, and never accept "root" as the invoker.
+if [ -n "${PKEXEC_UID:-}" ]; then
+    SUDO_USER_NAME="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f1)"
+elif [ -n "${SUDO_USER:-}" ]; then
+    SUDO_USER_NAME="$SUDO_USER"
 else
-    TARGET_HOME="$HOME"
+    SUDO_USER_NAME="$(logname 2>/dev/null || true)"
 fi
+if [ -z "$SUDO_USER_NAME" ] || [ "$SUDO_USER_NAME" = root ]; then
+    SUDO_USER_NAME="$(logname 2>/dev/null || id -un)"
+fi
+TARGET_HOME="$(getent passwd "$SUDO_USER_NAME" 2>/dev/null | cut -d: -f6)"
 [ -n "$TARGET_HOME" ] && [ -d "$TARGET_HOME" ] || {
-    echo "ERROR: cannot resolve the invoking user's home (got '$TARGET_HOME')" >&2
+    echo "ERROR: cannot resolve the invoking user's home (got '$TARGET_HOME' for '$SUDO_USER_NAME')" >&2
     exit 1
 }
 
@@ -168,19 +181,43 @@ run "$SCAN" --selftest || true
 
 echo "[6/6] enabling"
 run sudo systemctl daemon-reload
-run sudo systemctl enable --now arpwatch-spoof.service
+
+# enable + restart, NOT `enable --now`.
+#
+# `enable --now` only starts a unit if it is not already running. The previous
+# collector was started with the old ExecStart, so it would have kept running
+# with the old flags: no -D (so ethercodes.dat still unreadable) and no -P (so
+# /run/arpwatch-spoof.pid is never created). The scan unit then SIGHUPs a
+# nonexistent pidfile, silently does nothing, and goes back to scanning a file
+# arpwatch only refreshes every 15 minutes -- the exact bug this was meant to
+# fix, reintroduced by the installer.
+run sudo systemctl enable arpwatch-spoof.service
+run sudo systemctl restart arpwatch-spoof.service
+
+# The collector writes the pidfile the scan unit signals. If it is missing the
+# scan will quietly read stale data, so make that loud instead.
+if [ "$DRY" = 0 ]; then
+    sleep 1
+    if [ -s "$PIDFILE" ]; then
+        echo "    collector pid $(cat "$PIDFILE") -- scan unit can force a flush"
+    else
+        echo "    WARNING: $PIDFILE missing; the scan timer cannot force arpwatch" >&2
+        echo "             to flush arp.dat and will read stale data." >&2
+    fi
+fi
+
 run sudo systemctl enable --now arpwatch-spoof-scan.timer
 
 echo
 if [ "$DRY" = 1 ]; then
     echo "[+] DRY RUN complete. Re-run without --dry-run to apply."
 else
-    echo "[+] Installed. Verify:"
-    echo "      systemctl status arpwatch-spoof"
-    echo "      tail -f $LOG"
-    echo
-    echo "    A flip-flop raises a desktop notification. New hosts are logged only."
-    echo "    If the first real event shows the wrong fields, arpwatch's argument"
-    echo "    order differs from what the hook assumes -- the raw args are logged,"
-    echo "    so adjust and re-run."
+      echo "[+] Installed. Verify:"
+      echo "      systemctl status arpwatch-spoof"
+      echo "      systemctl start arpwatch-spoof-scan.service   # one scan, shows any error"
+      echo "      tail -f $LOG"
+      echo
+      echo "    Detection reads arp.dat (arpwatch 3.9 has no exec hook). A flip-flop"
+      echo "    raises a desktop notification; the 2-minute timer SIGHUPs arpwatch"
+      echo "    first, because arpwatch only rewrites arp.dat every 15 minutes."
 fi
