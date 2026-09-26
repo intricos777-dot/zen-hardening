@@ -235,8 +235,16 @@ print(json.dumps({
 PY
 )
     [ -f "$ALERT" ] || { log "alert script missing at $ALERT"; continue; }
-    out="$(python3 "$ALERT" "$payload" 2>&1)" || log "alert delivery failed"
-    [ -n "$out" ] && log "alert: $out"
+    # Log both outcomes. A silent notifier on success previously meant an empty
+    # log was ambiguous between delivered and dropped.
+    arc=0
+    out="$(python3 "$ALERT" "$payload" 2>&1)" || arc=$?
+    if [ "$arc" -ne 0 ]; then
+        log "alert DELIVERY FAILED for $ip (rc=$arc): ${out:-<no output>}"
+    else
+        log "alert delivered ok for $ip${out:+ | $out}"
+    fi
+    unset out arc
 done <<<"$newly"
 
 log "scan: $count new anomal$( [ "$count" = 1 ] && echo y || echo ies)"

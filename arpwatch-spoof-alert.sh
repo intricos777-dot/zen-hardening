@@ -132,10 +132,18 @@ PY
     # Capture the notifier's output rather than redirecting into $LOG: if the log
     # is not writable the redirect itself fails and the real error is lost,
     # which is exactly when you need to read it. log() falls back to stderr.
+    #
+    # Log BOTH outcomes. Previously a successful send produced no line at all
+    # (notify-send is silent on success), so "nothing in the log" was ambiguous
+    # between delivered and dropped -- the same ambiguity that hid the root-bus
+    # bug, where notifications failed while everything reported healthy.
     local out rc=0
     out="$(python3 "$ALERT" "$payload" 2>&1)" || rc=$?
-    [ -n "$out" ] && log "alert: $out"
-    [ "$rc" -ne 0 ] && log "alert delivery failed (rc=$rc)"
+    if [ "$rc" -ne 0 ]; then
+        log "alert DELIVERY FAILED (rc=$rc): ${out:-<no output>}"
+    else
+        log "alert delivered ok: ${1}${out:+ | $out}"
+    fi
     return 0
 }
 

@@ -38,9 +38,15 @@ if [ -n "${PKEXEC_UID:-}" ]; then
 elif [ -n "${SUDO_USER:-}" ]; then
   ACCOUNT="$SUDO_USER"
 else
-  ACCOUNT="${USER:-livings}"
+  ACCOUNT="$(logname 2>/dev/null || true)"
 fi
-[ -z "$ACCOUNT" ] && ACCOUNT=livings
+# Never operate on root's account. A recovery script that audits root is the
+# same class of bug it exists to fix, so treat "root" as an unresolved value
+# and fall through to the console user.
+if [ -z "$ACCOUNT" ] || [ "$ACCOUNT" = root ]; then
+  ACCOUNT="$(logname 2>/dev/null || id -un)"
+fi
+[ -n "$ACCOUNT" ] || { echo "ERROR: cannot resolve the account to recover" >&2; exit 1; }
 DEST=/etc/sudoers.d
 WHEEL_RULE="$DEST/10-installer"
 AUDIT_RULE="$DEST/audit-readonly"

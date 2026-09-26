@@ -29,10 +29,31 @@
 set -euo pipefail
 
 UNITS=(shield-kitty-watch.service evidence-seal.service evidence-seal.timer)
-SRC_WATCH="$HOME/Projects/shield-kitty/systemd"
-SRC_SEAL="$HOME/Projects/shield-kitty-forensics/systemd"
-DEST=/etc/systemd/user
-ACCOUNT="${SUDO_USER:-livings}"
+# Resolve the invoking user BEFORE deriving $HOME from it. Under sudo $HOME is
+# /root, and pkexec additionally leaves SUDO_USER unset, so a $HOME-based lookup
+# finds nothing. Hardcoding a name here would make the script silently target
+# the wrong account on any other machine.
+if [ -n "${PKEXEC_UID:-}" ]; then
+  ACCOUNT="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f1)"
+elif [ -n "${SUDO_USER:-}" ]; then
+  ACCOUNT="$SUDO_USER"
+else
+  ACCOUNT="$(logname 2>/dev/null || true)"
+fi
+[ -z "$ACCOUNT" ] || [ "$ACCOUNT" = root ] && ACCOUNT="$(logname 2>/dev/null || id -un)"
+ACCOUNT_HOME="$(getent passwd "$ACCOUNT" 2>/dev/null | cut -d: -f6)"
+if [ -z "$ACCOUNT_HOME" ] || [ ! -d "$ACCOUNT_HOME" ]; then
+  echo "ERROR: cannot resolve home for '$ACCOUNT' (refusing to install units for the wrong account)" >&2
+  exit 1
+fi
+SRC_WATCH="$ACCOUNT_HOME/Projects/shield-kitty/systemd"
+SRC_SEAL="$ACCOUNT_HOME/Projects/shield-kitty-forensics/systemd"
+# These MUST be user units, not system units: their ExecStart uses %h, which in
+# a system unit expands to /root and yields units that can never start.
+# /etc/systemd/user and ~/.config/systemd/user are both read by systemd; the
+# live install on this machine is in the latter. Keep this in sync with
+# `systemctl --user is-enabled` when checking.
+DEST="${SHIELD_KITTY_UNIT_DIR:-/etc/systemd/user}"
 
 if [[ "${1:-}" == "--remove" ]]; then
   echo "Removing Shield Kitty units..."

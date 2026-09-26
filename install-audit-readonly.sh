@@ -41,7 +41,18 @@ HELPERS=(
   audit-fail2ban
   audit-journal-err
 )
-SUDO_USER_NAME="${SUDO_USER:-livings}"
+# Grant NOPASSWD to whoever is actually running this, not a hardcoded account.
+# Under pkexec, SUDO_USER is unset and USER=root, so `${SUDO_USER:-livings}`
+# would have granted root (useless) on any machine not named livings.
+if [ -n "${PKEXEC_UID:-}" ]; then
+  SUDO_USER_NAME="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f1)"
+elif [ -n "${SUDO_USER:-}" ]; then
+  SUDO_USER_NAME="$SUDO_USER"
+else
+  SUDO_USER_NAME="$(logname 2>/dev/null || true)"
+fi
+[ -z "$SUDO_USER_NAME" ] || [ "$SUDO_USER_NAME" = root ] && SUDO_USER_NAME="$(logname 2>/dev/null || id -un)"
+[ -n "$SUDO_USER_NAME" ] || { echo "ERROR: cannot resolve invoking user" >&2; exit 1; }
 
 if [[ "${1:-}" == "--remove" ]]; then
   echo "Removing audit helpers..."

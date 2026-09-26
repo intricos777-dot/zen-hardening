@@ -51,8 +51,12 @@ TARGET_HOME="$(getent passwd "$SUDO_USER_NAME" 2>/dev/null | cut -d: -f6)"
 # The units also hardcode /run/user/1000 for the session bus. Rewriting only the
 # home path would leave the bus pointing at the wrong user's runtime dir, so
 # resolve the uid too and rewrite both.
-TARGET_USER="${SUDO_USER_NAME:-$(stat -c %U "$TARGET_HOME")}"
-TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)"
+TARGET_USER="$SUDO_USER_NAME"
+TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null)"
+[ -n "$TARGET_UID" ] || {
+    echo "ERROR: cannot resolve uid for '$TARGET_USER' (refusing to guess)" >&2
+    exit 1
+}
 HOOK="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-alert.sh"
 SCAN="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-scan.sh"
 UNIT_DST_DIR=/etc/systemd/system
