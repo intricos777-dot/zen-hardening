@@ -34,6 +34,12 @@ fi
     echo "ERROR: cannot resolve the invoking user's home (got '$TARGET_HOME')" >&2
     exit 1
 }
+
+# The units also hardcode /run/user/1000 for the session bus. Rewriting only the
+# home path would leave the bus pointing at the wrong user's runtime dir, so
+# resolve the uid too and rewrite both.
+TARGET_USER="${SUDO_USER_NAME:-$(stat -c %U "$TARGET_HOME")}"
+TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)"
 HOOK="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-alert.sh"
 SCAN="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-scan.sh"
 UNIT_DST_DIR=/etc/systemd/system
@@ -49,9 +55,16 @@ ARPWATCH_ARGS="-F -i $IFACE -f $DB -D /var/lib/arpwatch -P $PIDFILE -s -N -z"
 # it in the foreground with a working socket and it never returns -- the
 # install hung on a perfectly healthy arpwatch. timeout 3 caps it, and exit 124
 # then means "still running", i.e. the flags were accepted.
-ARPWATCH_PROBE_DB="$(mktemp -u)/probe.dat"
-ARPWATCH_PROBE_PID="$(mktemp -u)/probe.pid"
-mkdir -p "$(dirname "$ARPWATCH_PROBE_DB")"
+# One temp dir for BOTH probe paths. Two separate mktemp -u calls produced two
+# different directories, and only the datafile's was cleaned up -- under root,
+# where the probe actually runs, arpwatch writes the pidfile and leaves an
+# orphan directory behind on every install.
+#
+# mktemp -d rather than mktemp -u: -u only prints a name, it does not create
+# anything, so it races with whatever else is on the system.
+ARPWATCH_PROBE_DIR="$(mktemp -d)"
+ARPWATCH_PROBE_DB="$ARPWATCH_PROBE_DIR/probe.dat"
+ARPWATCH_PROBE_PID="$ARPWATCH_PROBE_DIR/probe.pid"
 
 run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
 
@@ -104,7 +117,7 @@ if command -v arpwatch >/dev/null 2>&1; then
     else
         echo "    flags parse OK: arpwatch $ARPWATCH_ARGS (probe exited $probe_rc, unprivileged socket denial)"
     fi
-    rm -rf "$(dirname "$ARPWATCH_PROBE_DB")"
+    rm -rf "$ARPWATCH_PROBE_DIR"
 fi
 
 echo "[3/6] preparing state"
@@ -137,7 +150,9 @@ fi
 echo "[4/6] installing units"
 UNIT_TMP="$(mktemp)"
 for u in arpwatch-spoof.service arpwatch-spoof-scan.service arpwatch-spoof-scan.timer; do
-    sed -e "s#/home/livings#$TARGET_HOME#g" "$HERE/$u" > "$UNIT_TMP"
+    sed -e "s#/home/livings#$TARGET_HOME#g" \
+        -e "s#/run/user/1000#/run/user/$TARGET_UID#g" \
+        "$HERE/$u" > "$UNIT_TMP"
     if ! grep -q "^Environment=HOME=" "$UNIT_TMP"; then
         sed -i "/^\[Service\]/a Environment=HOME=$TARGET_HOME" "$UNIT_TMP"
     fi

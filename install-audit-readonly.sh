@@ -160,7 +160,12 @@ set -uo pipefail
 echo "== fail2ban-client status =="
 fail2ban-client status 2>&1
 echo
-JAILS=$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p')
+# fail2ban prints the jail list COMMA-separated ("recidive, sshd"), so
+# splitting on whitespace yields a bogus jail named "recidive,". Translate
+# commas to spaces first, then drop empties.
+JAILS=$(fail2ban-client status 2>/dev/null \
+        | sed -n 's/.*Jail list:[[:space:]]*//p' \
+        | tr ',' ' ' | tr -s ' ')
 for j in $JAILS; do
   echo "== jail: $j =="
   fail2ban-client status "$j" 2>&1 | sed -n '1,8p'
@@ -229,12 +234,16 @@ echo "  [ok] installed $(ls -1 /usr/local/sbin/audit-* | wc -l) read-only helper
 chmod 0440 "$SUDOERS_FILE"
 chown root:root "$SUDOERS_FILE"
 
-if visudo -c 2>&1 | sed 's/^/  /'; then
-  echo "  [ok] sudoers syntax valid"
+# Validate ONLY this file. Do not gate on whole-tree `visudo -c`: that exits
+# non-zero whenever any unrelated file in /etc/sudoers.d has bad permissions,
+# which caused this installer to delete a perfectly valid drop-in (its own
+# output said "parsed OK" while the script threw it away).
+if visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
+  echo "  [ok] $SUDOERS_FILE parses cleanly"
 else
-  echo "  [!!] sudoers INVALID -- removing to avoid a broken sudo" >&2
+  echo "  [!!] $SUDOERS_FILE INVALID -- removing to avoid a broken sudo" >&2
+  visudo -cf "$SUDOERS_FILE" 2>&1 | sed 's/^/      /' >&2
   rm -f "$SUDOERS_FILE"
-  visudo -c 2>&1 | sed 's/^/  /' || true
   exit 1
 fi
 

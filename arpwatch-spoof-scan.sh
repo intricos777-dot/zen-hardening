@@ -38,6 +38,14 @@ LOG="${BDE_ARPWATCH_LOG:-/var/log/arpwatch-spoof.log}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALERT="${BDE_ALERT:-$(dirname "$HERE")/shield-kitty/shield-kitty-alert.py}"
 
+# How long a mac/ip binding counts towards a spoof, in seconds.
+#
+# arp.dat is append-only, so without a window an ordinary DHCP reassignment
+# reads as a permanent two-MAC conflict and the alert can never clear. 3600
+# (1h) is deliberately longer than arpwatch's 15-minute flush so a genuine
+# attack is seen across several consecutive scans.
+WINDOW="${BDE_SPOOF_WINDOW:-3600}"
+
 # Reconstruct the graphical session so notify-send works. The scanner runs from
 # a system unit, so it inherits none of DISPLAY/DBUS and every alert would fail
 # silently. See the same logic in arpwatch-spoof-alert.sh.
@@ -106,12 +114,45 @@ if [ "${1:-}" = "--selftest" ]; then selftest; exit 0; fi
 # Build the current anomaly set: "ip mac1,mac2,..." for every IP with more than
 # one DISTINCT MAC.
 #
+# THE WINDOW IS ESSENTIAL, NOT COSMETIC.
+#
+# arp.dat is APPEND-ONLY HISTORY, not current state. arpwatch adds a row the
+# first time it sees a mac/ip pair and never removes one. So a single ordinary
+# DHCP reassignment leaves this forever:
+#
+#     10.197.250.100  aa:bb:cc:00:00:01   <- laptop A, yesterday
+#     10.197.250.100  cc:dd:ee:00:00:02   <- laptop B, today
+#
+# Reading the whole file calls that a permanent spoof. It alerts once, then
+# "persists" on every scan, and because the state is never cleared the alert can
+# never go away. On a /8 with constant lease churn that is guaranteed to fire on
+# innocent devices, and a monitor that cries wolf gets ignored.
+#
+# So only bindings FIRST SEEN within WINDOW seconds count. A historical change
+# ages out; an attack in progress is inside the window and is reported.
+#
+# The trade-off, stated plainly: arpwatch does not re-append a pair it already
+# knows, so a spoof that is *continuing* is only visible for WINDOW seconds after
+# its first sighting, then ages out like anything else. There is no way to tell
+# "still spoofing" from "seen once" using the datafile alone. The window is set
+# generously to favour catching attacks over suppressing noise, and arpwatch's
+# own flip-flop reports keep going to the journal regardless.
+#
+# BDE_SPOOF_NOW exists so tests can pin the clock; production leaves it unset.
+#
 # Distinctness matters. Testing for a comma is not enough: arpwatch can list the
 # same hardware address twice with different capitalisation, and joining those
 # yields "mac,mac" -- a comma, but still one device. Counting unique values is
 # the only way to avoid alerting on a formatting difference.
-current="$(
-    awk 'NF >= 2 {
+all="$(
+    awk -v now="${BDE_SPOOF_NOW:-$(date +%s)}" -v window="$WINDOW" '
+    function kept(ts) {
+        # Unparseable timestamp: keep the row rather than risk missing a live
+        # attack over a formatting surprise.
+        if (ts !~ /^[0-9]+$/) return 1
+        return (ts + 0) >= (now - window)
+    }
+    NF >= 3 && kept($3) {
             ip = $2
             mac = tolower($1)
             if (!(ip in seen)) { seen[ip] = mac; order[ip] = 1; next }
@@ -130,7 +171,22 @@ current="$(
          }' "$DATAFILE" 2>/dev/null | sort
 )"
 
-if [ -z "$current" ]; then
+# Every IP currently flagged as spoofed, whether or not it alerted.
+alerting=""
+while read -r ip macs; do
+    [ -n "$ip" ] || continue
+    if in_ignore "$ip"; then
+        log "scan: $ip ($macs) ignored by BDE_SPOOF_IGNORE"
+        continue
+    fi
+    alerting+="$ip $macs"$'\n'
+done <<<"$all"
+
+# State holds exactly what we are currently reporting on. Ignored addresses are
+# excluded on purpose: if one was recorded while ignored and later removed from
+# BDE_SPOOF_IGNORE, matching against state would call it "persists" and it would
+# never alert at all.
+if [ -z "$alerting" ]; then
     # Clear the state, not just skip. Leaving it stale means a spoof that is
     # resolved and later returns would be silently swallowed as "already seen".
     [ -s "$STATE" ] && { : >"$STATE" 2>/dev/null || log "could not clear state file $STATE"; }
@@ -146,15 +202,14 @@ previous=""
 newly=""
 while read -r ip macs; do
     [ -n "$ip" ] || continue
-    in_ignore "$ip" && { log "scan: $ip ($macs) ignored by BDE_SPOOF_IGNORE"; continue; }
     if ! printf '%s\n' "$previous" | grep -qxF "$ip $macs"; then
         newly+="$ip $macs"$'\n'
     else
         log "scan: $ip ($macs) persists, not re-alerting"
     fi
-done <<<"$current"
+done <<<"$alerting"
 
-printf '%s' "$current" >"$STATE" 2>/dev/null || log "could not write state file $STATE"
+printf '%s' "$alerting" >"$STATE" 2>/dev/null || log "could not write state file $STATE"
 
 [ -z "$newly" ] && { log "scan: no new anomalies"; exit 0; }
 

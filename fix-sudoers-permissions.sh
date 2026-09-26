@@ -75,11 +75,17 @@ for f in /etc/sudoers.d/*; do
   elif [ -z "$body" ]; then
     klass="stock-defaults"
   elif printf '%s' "$body" | grep -qiE 'NOPASSWD'; then
+    # The genuinely dangerous pattern. NOPASSWD means root without a
+    # password; that is what must never be silently activated.
     klass="grants-access (contains NOPASSWD)"
-  elif printf '%s' "$body" | grep -qiE '^[^#]*ALL[[:space:]]*=[[:space:]]*\([^)]*\)[[:space:]]*ALL'; then
-    klass="grants-access (ALL=(...) ALL)"
-  elif printf '%s' "$body" | grep -qiE '^[^#]*\bALL\b[[:space:]]*$|^[^#]*ALL[[:space:]]+ALL'; then
-    klass="grants-access (ALL ALL)"
+  elif printf '%s' "$body" | grep -qiE 'ALL[[:space:]]*=[[:space:]]*\([^)]*\)[[:space:]]*ALL|ALL[[:space:]]+ALL'; then
+    # CORRECTION. An earlier version of this script classified
+    # "ALL=(ALL) ALL" as dangerous and quarantined it. That was wrong and
+    # broke sudo: `%wheel ALL=(ALL) ALL` is the STOCK Arch rule that grants
+    # wheel full sudo WITH a password prompt. Requiring a password is the
+    # baseline, not a threat. Only NOPASSWD removes the password, so only
+    # NOPASSWD warrants quarantine.
+    klass="password-required-sudo (safe)"
   elif printf '%s' "$body" | grep -qE '^[[:space:]]*Defaults'; then
     klass="stock-defaults"
   else
@@ -87,10 +93,10 @@ for f in /etc/sudoers.d/*; do
   fi
 
   case "$klass" in
-    stock-defaults)
+    stock-defaults|password-required-sudo*)
       chmod 0440 "$f"
       chown root:root "$f"
-      REPORT+=("  [ok] $name: $klass -> activated at 0440 (owner $owner)")
+      REPORT+=("  [ok] $name: $klass -> activated at 0440 (was mode $mode, owner $owner)")
       ;;
     *)
       cp -a "$f" "$QUARANTINE/$name"
