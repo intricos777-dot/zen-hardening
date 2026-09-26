@@ -1,0 +1,17 @@
+[Unit]
+Description=bchn monitor — Bitcoin Cash node and wallet state
+Documentation=file://%h/Projects/zen-hardening/bchn-monitor.py
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/zen-hardening
+ExecStart=/usr/bin/python3 %h/Projects/zen-hardening/bchn-monitor.py status
+# Reports rather than blocks. A missing wallet directory is a fact to surface,
+# not a reason to fail the unit and spam the journal on every timer tick.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Watchman — Sentinel integrity supervisor
+Documentation=file://%h/Projects/zen-hardening/watchman.py
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/zen-hardening
+ExecStart=/usr/bin/python3 %h/Projects/zen-hardening/watchman.py run --interval 300
+Restart=on-failure
+RestartSec=30
+# Notification needs the desktop session's bus. If this unit is ever moved to
+# the system manager, notify-send from root cannot reach the user's session and
+# the watcher would report success while telling nobody anything.
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

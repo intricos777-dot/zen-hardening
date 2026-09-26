@@ -17,6 +17,7 @@ set -euo pipefail
 
 TARGET="zero"
 CHANGED=0
+MAC_FAILED=0
 
 hr() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
@@ -48,15 +49,44 @@ hr "2. Per-network random MAC on wifi"
 # Without this, NetworkManager uses the permanent hardware MAC on every
 # network the machine ever joins, which is the strongest cross-network
 # tracking signal there is.
+#
+# PROPERTY NAME DIFFERS BY NetworkManager VERSION. Verified on 1.58.1:
+#   802-11-wireless.mac-address-randomization   (this version)
+#       0 = default, 1 = random (per network), 2 = stable
+# Older releases used 802-11-wireless.mac-address-mode with values
+# random/stable/preserve. Detect which one this build accepts rather than
+# assuming, and fail loudly if neither works -- a silent no-op here means
+# the hardware MAC keeps broadcasting.
+set_mac_prop=""
+if nmcli -g 802-11-wireless.mac-address-randomization con show "$(nmcli -t -f UUID con show | head -1)" >/dev/null 2>&1; then
+  set_mac_prop="802-11-wireless.mac-address-randomization"
+  # Values differ by NetworkManager version and getting this wrong is SILENT:
+  #   NM >= 1.42 uses a flags enum. nmcli accepts exactly:
+  #       default | never | always
+  #   and the numeric aliases are NOT boolean: 1 means NEVER, not yes.
+  #   Setting 1 therefore turns randomization OFF while looking like success.
+  # Verified on 1.58.1, which rejects both "yes" and "random".
+  set_mac_val="always"
+else
+  set_mac_prop="802-11-wireless.mac-address-mode"
+  set_mac_val="random"
+fi
+echo "  using property: ${set_mac_prop} = ${set_mac_val}"
+
 while read -r uuid; do
   [ -z "$uuid" ] && continue
   con_id=$(nmcli -g connection.id con show "$uuid")
-  if nmcli -g 802-11-wireless.mac-address-mode con show "$uuid" 2>/dev/null | grep -qx random; then
-    echo "  '${con_id}': already random — skipping"
+  cur=$(nmcli -g "$set_mac_prop" con show "$uuid" 2>/dev/null)
+  if [ "$cur" = "$set_mac_val" ] || [ "$cur" = "random" ]; then
+    echo "  '${con_id}': already randomized — skipping"
   else
-    nmcli con mod "$uuid" 802-11-wireless.mac-address-mode random
-    CHANGED=1
-    echo "  [ok] '${con_id}': mac-address-mode -> random"
+    if ! nmcli con mod "$uuid" "$set_mac_prop" "$set_mac_val"; then
+      echo "  [!!] FAILED to set MAC randomization on '${con_id}'" >&2
+      MAC_FAILED=1
+    else
+      CHANGED=1
+      echo "  [ok] '${con_id}': mac randomization -> ${set_mac_val}"
+    fi
   fi
 done < <(nmcli -t -f UUID,TYPE con show | awk -F: '$2=="802-11-wireless"{print $1}')
 
@@ -79,6 +109,11 @@ while read -r uuid; do
 done < <(nmcli -t -f UUID con show)
 
 hr "Result"
+
+if [ "$MAC_FAILED" -eq 1 ]; then
+  echo "  [!!] AT LEAST ONE CONNECTION FAILED MAC RANDOMIZATION." >&2
+  echo "       Your permanent hardware MAC may still be broadcasting." >&2
+fi
 
 if [ "$CHANGED" -eq 1 ]; then
   echo "  changes applied. To publish the new mDNS name immediately:"

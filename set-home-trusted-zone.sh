@@ -99,14 +99,28 @@ echo "  [ok] allowed: kdeconnectd, mdns, dhcpv6-client — nothing else"
 
 # ── BIND SSID ────────────────────────────────────────────────────────────
 hr "Binding '${SSID}' to ${ZONE}"
-firewall-cmd --permanent --zone="$ZONE" --change-interface=wlo0 2>/dev/null || true
+# Discover the interface from the connection rather than hardcoding wlo0.
+# Interface names are not stable across reboots, machines and adapters
+# (wlo1 here, wlo0 on a different host), and a stale name makes the
+# firewall bind nothing while still reporting success.
+IFACE=$(nmcli -g connection.interface-name con show "$conn" 2>/dev/null)
+[ -z "$IFACE" ] && IFACE=$(nmcli -g GENERAL.DEVICE con show "$conn" 2>/dev/null)
+[ -z "$IFACE" ] && IFACE=$(nmcli -g IP4.DEVICE con show "$conn" 2>/dev/null)
+if [ -z "$IFACE" ] || [ ! -e "/sys/class/net/$IFACE" ]; then
+  echo "  [!!] could not determine the interface for '${conn}'." >&2
+  echo "       Set the zone by connection name instead, then verify with:" >&2
+  echo "         firewall-cmd --get-zone-of-interface=<iface>" >&2
+  exit 1
+fi
+echo "  interface: ${IFACE}"
+firewall-cmd --permanent --zone="$ZONE" --change-interface="$IFACE" 2>/dev/null || true
 nmcli con mod "$conn" connection.zone "$ZONE"
 nmcli con up "$conn" >/dev/null
-echo "  [ok] '${conn}' now uses zone ${ZONE}"
+echo "  [ok] '${conn}' (${IFACE}) now uses zone ${ZONE}"
 
 hr "Result"
 echo "  Verify:"
-echo "    firewall-cmd --get-zone-of-interface=wlo0"
+echo "    firewall-cmd --get-zone-of-interface=${IFACE}"
 echo "    firewall-cmd --zone=${ZONE} --list-all"
 echo
 echo "  REVERT (back to fully strict):"
