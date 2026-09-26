@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Workstation zone - Garuda Linux / Arch
+
+  WHY A NEW ZONE INSTEAD OF OVERRIDING "public":
+  firewalld MERGES an /etc zone file over the built-in zone of the same
+  name, and a zone file cannot subtract an inherited service (there is no
+  remove-service element in firewalld 2.5.2, and <service> accepts only
+  a name attribute). So overriding "public" can never produce a truly
+  empty allowlist. A uniquely-named zone has no built-in twin, inherits
+  nothing, and starts empty.
+
+  Result: ALL inbound denied except dhcpv6-client. No ssh, no mdns,
+  no samba, no kdeconnectd.
+
+  Install:
+    sudo cp workstation.xml /etc/firewalld/zones/workstation.xml
+    sudo rm -f /etc/firewalld/zones/public.xml
+    sudo firewall-cmd reload
+    sudo firewall-cmd set-default-zone=workstation
+    sudo firewall-cmd zone=workstation change-interface=wlo0
+    sudo nmcli con mod "USL - Public" connection.zone workstation
+    sudo nmcli con up "USL - Public"
+
+  Revert:
+    sudo rm /etc/firewalld/zones/workstation.xml
+    sudo firewall-cmd set-default-zone=public
+    sudo nmcli con mod "USL - Public" connection.zone public
+    sudo nmcli con up "USL - Public"
+
+  ICMP NOTE: icmp_blocks is empty by default in a custom zone, which is
+  correct. packet-too-big (PMTU) and v6-neighbour-solicit (IPv6 NDP)
+  MUST stay unblocked or IPv6 breaks and large HTTPS downloads stall.
+  Do not add icmp-block-inversion or block these types.
+
+  Verified against firewalld 2.5.2 zone_reader before publishing.
+-->
+<zone>
+  <short>Workstation</short>
+  <description>Strict workstation profile: deny all inbound except DHCPv6.</description>
+
+  <service name="dhcpv6-client"/>
+
+  <protocol value="icmp"/>
+  <protocol value="ipv6-icmp"/>
+</zone>
