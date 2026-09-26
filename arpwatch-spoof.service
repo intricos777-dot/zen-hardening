@@ -1,33 +1,33 @@
 [Unit]
-Description=ARP spoof watcher (arpwatch -> Shield Kitty notification)
-Documentation=file://%h/Projects/zen-hardening/arpwatch-spoof-alert.sh
+Description=ARP spoof watcher (arpwatch datafile collector)
+Documentation=file://%h/Projects/zen-hardening/arpwatch-spoof-scan.sh
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-# arpwatch must start as root to open the AF_PACKET raw socket, then drop to
-# `livings` with -u. That drop is what makes the exec hook work: the hook calls
-# notify-send, which needs the USER's session bus. Running the hook as root
-# would silently deliver the alert to nobody. Do not add User= here -- it would
-# stop the raw socket from opening at all.
+# arpwatch 3.9 flags ONLY. It has no -a (exec hook), no -u, no -c, and wants
+# -i INTERFACE rather than a positional argument. Getting this wrong is what
+# made the earlier version exit 1 in a restart loop.
 #
-# Both writable paths are owned by livings, because after the drop that is who
-# arpwatch is: the database and the log. The database is in /var/lib rather than
-# ~ so that ProtectHome=read-only below still applies.
-ExecStart=/usr/sbin/arpwatch -q -u livings -c /var/lib/arpwatch/arpwatch.dat -a /home/livings/Projects/zen-hardening/arpwatch-spoof-alert.sh wlo1
+#   -F  stay in the foreground; systemd wants the process, not a fork
+#   -i  interface (3.9 syntax)
+#   -f  datafile the scanner reads
+#   -s  no email reports; there is no MTA here and it would queue forever
+#   -q  no syslog report spam; the scanner does its own detection and notifies
+#   -N  no bogon reports  -- important on a /8, where most traffic looks odd
+#   -z  no 0.0.0.0 reports -- arpwatch(8) recommends this for busy DHCP networks
+ExecStart=/usr/sbin/arpwatch -F -i wlo1 -f /var/lib/arpwatch/arp.dat -s -q -N -z
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 
-ReadWritePaths=/var/lib/arpwatch /var/log
+# Needs the raw socket only. Runs as root because pcap_bind needs it; the
+# datafile is what the unprivileged scanner reads.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectKernelTunables=true
-ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ProtectSystem=full
-# The hook only READS the alert script from ~, so this stays on.
-ProtectHome=read-only
+ReadWritePaths=/var/lib/arpwatch
 
 [Install]
 WantedBy=multi-user.target

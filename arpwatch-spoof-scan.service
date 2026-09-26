@@ -1,0 +1,17 @@
+[Unit]
+Description=Scan arpwatch datafile for ARP spoofing
+Documentation=file://%h/Projects/zen-hardening/arpwatch-spoof-scan.sh
+After=arpwatch-spoof.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/livings
+ExecStart=/home/livings/Projects/zen-hardening/arpwatch-spoof-scan.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/arpwatch /var/log

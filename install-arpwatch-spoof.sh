@@ -16,10 +16,9 @@ DRY=0
 [[ "${1:-}" == "--dry-run" ]] && DRY=1
 
 IFACE="${BDE_IFACE:-wlo1}"
-DB=/var/lib/arpwatch/arpwatch.dat
+DB=/var/lib/arpwatch/arp.dat
 LOG=/var/log/arpwatch-spoof.log
-UNIT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/arpwatch-spoof.service"
-UNIT_DST=/etc/systemd/system/arpwatch-spoof.service
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve the REAL user's home. Under sudo, $HOME is /root, so every path into
 # the user's own ~/Projects silently becomes /root/Projects/... and the script
@@ -35,6 +34,8 @@ fi
     exit 1
 }
 HOOK="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-alert.sh"
+SCAN="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-scan.sh"
+UNIT_DST_DIR=/etc/systemd/system
 
 run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
 
@@ -45,7 +46,7 @@ echo "  database  : $DB"
 echo "  log       : $LOG"
 [ "$DRY" = 1 ] && echo "  mode      : DRY RUN"
 
-echo "[1/5] checking prerequisites"
+echo "[1/6] checking prerequisites"
 if ! ip link show "$IFACE" >/dev/null 2>&1; then
     echo "    ERROR: interface $IFACE does not exist." >&2
     echo "    Check with: ip -br link" >&2
@@ -55,42 +56,47 @@ echo "    $IFACE present"
 [ -x "$HOOK" ] || { echo "    ERROR: hook not executable: $HOOK" >&2; exit 1; }
 echo "    hook executable"
 
-echo "[2/5] installing arpwatch"
+echo "[2/6] installing arpwatch"
 if pacman -Qi arpwatch >/dev/null 2>&1; then
     echo "    already installed"
 else
     run sudo pacman -S --noconfirm --needed arpwatch
 fi
 
-echo "[3/5] preparing state"
+echo "[3/6] preparing state"
 # Owned by livings, not root: arpwatch drops to livings via -u before it writes
 # either of these, and the exec hook runs as livings so notify-send can reach
 # the session bus. Root-owned files here would break the service.
-run sudo install -d -m 0750 -o livings -g livings /var/lib/arpwatch
+run sudo install -d -m 0750 -o root -g root /var/lib/arpwatch
+# arpwatch(8): "an empty arp.dat file must be created before the first run".
+run sudo install -m 0644 -o root -g root /dev/null /var/lib/arpwatch/arp.dat
 if [ -f "$LOG" ]; then
     echo "    existing $LOG preserved"
 else
     run sudo install -m 0640 -o livings -g livings /dev/null "$LOG"
 fi
 
-echo "[4/5] installing unit"
-# The unit in the repo has this user's path baked in. Rewrite the home and add an
-# explicit Environment=HOME, so the installed unit always matches the resolved
-# home rather than whatever was committed. The hook needs a correct HOME too:
-# systemd starts the service as root, and arpwatch's -u does not fix up the
-# environment, so without this the hook sees HOME=/root.
+echo "[4/6] installing units"
 UNIT_TMP="$(mktemp)"
-sed -e "s#/home/livings#$TARGET_HOME#g" "$UNIT_SRC" > "$UNIT_TMP"
-if ! grep -q "^Environment=HOME=" "$UNIT_TMP"; then
-    sed -i "/^\[Service\]/a Environment=HOME=$TARGET_HOME" "$UNIT_TMP"
-fi
-run sudo install -Dm644 "$UNIT_TMP" "$UNIT_DST"
+for u in arpwatch-spoof.service arpwatch-spoof-scan.service arpwatch-spoof-scan.timer; do
+    sed -e "s#/home/livings#$TARGET_HOME#g" "$HERE/$u" > "$UNIT_TMP"
+    if ! grep -q "^Environment=HOME=" "$UNIT_TMP"; then
+        sed -i "/^\[Service\]/a Environment=HOME=$TARGET_HOME" "$UNIT_TMP"
+    fi
+    run sudo install -Dm644 "$UNIT_TMP" "$UNIT_DST_DIR/$u"
+    echo "    installed $u"
+done
 rm -f "$UNIT_TMP"
-echo "    unit paths resolved against $TARGET_HOME"
 
-echo "[5/5] enabling"
+echo "[5/6] checking scanner prerequisites"
+[ -x "$SCAN" ] || { echo "    ERROR: scanner not executable: $SCAN" >&2; exit 1; }
+echo "    scanner executable"
+run "$SCAN" --selftest || true
+
+echo "[6/6] enabling"
 run sudo systemctl daemon-reload
 run sudo systemctl enable --now arpwatch-spoof.service
+run sudo systemctl enable --now arpwatch-spoof-scan.timer
 
 echo
 if [ "$DRY" = 1 ]; then

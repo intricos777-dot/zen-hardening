@@ -1,0 +1,13 @@
+[Unit]
+Description=Scan for ARP spoofing every 2 minutes
+Requires=arpwatch-spoof.service
+After=arpwatch-spoof.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=arpwatch-spoof-scan.service
+
+[Install]
+WantedBy=timers.target
