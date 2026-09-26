@@ -13,10 +13,16 @@ Wants=network-online.target
 #   -i  interface (3.9 syntax)
 #   -f  datafile the scanner reads
 #   -s  no email reports; there is no MTA here and it would queue forever
-#   -q  no syslog report spam; the scanner does its own detection and notifies
 #   -N  no bogon reports  -- important on a /8, where most traffic looks odd
 #   -z  no 0.0.0.0 reports -- arpwatch(8) recommends this for busy DHCP networks
-ExecStart=/usr/sbin/arpwatch -F -i wlo1 -f /var/lib/arpwatch/arp.dat -s -q -N -z
+#
+# DO NOT ADD -q. arpwatch(8) lists it in the synopsis [-CdFNpqsvzZ] and
+# describes it, but the 3.9 binary REJECTS it and prints usage, then exits 1.
+# Every other letter in that synopsis is accepted; -q is the sole exception,
+# which makes the man page wrong rather than the flag obscure. Verified by
+# running each letter. install-arpwatch-spoof.sh now parse-checks this command
+# so a bad flag cannot ship again.
+ExecStart=/usr/sbin/arpwatch -F -i wlo1 -f /var/lib/arpwatch/arp.dat -s -N -z
 Restart=on-failure
 RestartSec=30
 

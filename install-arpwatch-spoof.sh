@@ -37,6 +37,10 @@ HOOK="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-alert.sh"
 SCAN="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-scan.sh"
 UNIT_DST_DIR=/etc/systemd/system
 
+# Kept in one place and shared with the unit via the parse-check below, so the
+# two cannot drift. -q is deliberately absent: see arpwatch-spoof.service.
+ARPWATCH_ARGS="-F -i $IFACE -f $DB -s -N -z"
+
 run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
 
 echo "=== arpwatch spoof detection installer ==="
@@ -61,6 +65,25 @@ if pacman -Qi arpwatch >/dev/null 2>&1; then
     echo "    already installed"
 else
     run sudo pacman -S --noconfirm --needed arpwatch
+fi
+
+# Parse-check the exact flags the unit will use.
+#
+# arpwatch(8) is wrong about -q: it lists -q in the synopsis and describes it,
+# but the binary rejects it, prints usage and exits 1. arpwatch prints that
+# usage BEFORE it tries to open the raw socket, so the check works unprivileged
+# and costs nothing. Getting this wrong produced a service stuck in a restart
+# loop, twice, because the failure only shows up in the journal.
+if command -v arpwatch >/dev/null 2>&1; then
+    if arpwatch $ARPWATCH_ARGS >/dev/null 2>&1 || \
+       ! arpwatch $ARPWATCH_ARGS 2>&1 | head -3 | grep -q usage; then
+        echo "    flags parse OK: arpwatch $ARPWATCH_ARGS"
+    else
+        echo "    ERROR: arpwatch rejects these flags: $ARPWATCH_ARGS" >&2
+        echo "           it printed its usage message. Check the man page" >&2
+        echo "           against the binary -- they disagree about -q." >&2
+        exit 1
+    fi
 fi
 
 echo "[3/6] preparing state"
