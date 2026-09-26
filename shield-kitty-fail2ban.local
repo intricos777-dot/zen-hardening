@@ -1,115 +1,129 @@
-# /etc/fail2ban/jail.d/shield-kitty.local
+# /etc/fail2ban/jail.d/shield-kitty.conf
 #
-# Permanent source-IP bans for brute-force attempts.
+# Source-IP bans for remote brute-force attempts.
 #
 # WHY NOT faillock: pam_faillock tallies per-USERNAME and has no concept of
 # a source IP, host, or permanent state. It cannot "lock out a system" — it
 # can only lock an account, and every lockout expires. fail2ban keys on the
-# source address, which is what "permanently lock out any system attempting
-# to bruteforce" actually requires.
+# source address, which is what "ban a system attempting to bruteforce"
+# actually requires.
 #
-# Install:  sudo cp shield-kitty-fail2ban.local /etc/fail2ban/jail.d/
-#           sudo systemctl enable --now fail2ban
+# Install:  sudo cp shield-kitty-fail2ban.local /etc/fail2ban/jail.d/shield-kitty.conf
 # Verify:   sudo fail2ban-client status
-# Unban:    sudo fail2ban-client set <jail> unbanip <ip>
+# Unban:    sudo ~/Projects/zen-hardening/unban-self.sh
 #
-# ⚠ PERMANENT BANS ARE NOT SELF-CANCELLING.
-# If your own IP is banned (e.g. repeated fat-fingered password attempts at
-# the SDDM greeter), you are locked out until you clear the ban from a
-# console. See ignoreip below — it is the safety margin, do not trim it
-# casually.
+# ── WHAT THIS FILE DELIBERATELY DOES NOT DO ────────────────────────────────
+# There are no sddm or sudo jails here, and adding them back would be a
+# mistake. Both are LOCAL console events:
+#
+#   - An SDDM greeter failure means someone is standing at your keyboard.
+#   - A bad sudo password comes from a local tty.
+#
+# The shipped `pam-generic` filter needs a literal `rhost=<IP>` field to
+# extract an address to ban. Local console events have no such field:
+#
+#   fail2ban-regex remote.log /etc/fail2ban/filter.d/pam-generic.conf  -> 1 matched
+#   fail2ban-regex local.log  /etc/fail2ban/filter.d/pam-generic.conf  -> 0 matched
+#
+# A person at your laptop cannot be banned by IP because they are not
+# coming from an IP. Those cases are covered by pam_faillock (sudo, at
+# deny=10) and by physical means (the greeter). See fail2ban-coverage.md.
+#
+# The greeter has NO automated protection. That is a real gap, and no log
+# filter closes it. Mitigations: strong greeter password, deny=10, auto
+# screen lock, close the lid.
+#
+# ── BANTIME ────────────────────────────────────────────────────────────────
+# 1 day (86400s), not -1. A permanent ban is not self-cancelling: on a
+# public address, a handful of wrong passwords would lock you out of your
+# own machine on every port with no expiry. ignoreip below is the safety
+# margin for RFC1918 networks, but it does not cover tethering, cafe
+# wifi, or airports, so bantime is finite by design.
+#
+# ⚠ RE-ENABLE RECIDIVE AFTER EVERY COPY OF THIS FILE.
+# recidive ships with enabled=false so a first-ever install cannot abort
+# (see its section below). That means copying this file over an existing
+# /etc copy SILENTLY DISABLES RECIDIVE. After any install, run:
+#
+#   sudo sed -i 's/^enabled  = false/enabled  = true/' \
+#            /etc/fail2ban/jail.d/shield-kitty.conf
+#   sudo systemctl stop fail2ban && sudo systemctl restart fail2ban
+#
+# Verify with: sudo fail2ban-client status   -> must list 2 jails.
 
 [DEFAULT]
-# Never ban the local machine or the local network. This is what prevents a
-# fat-fingered password from permanently locking YOU out of your own laptop.
+# Never ban the local machine or your own LAN.
 ignoreip = 127.0.0.1/8 ::1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
            169.254.0.0/16 fe80::/10
-# Fail2ban's own traffic must never be bannable, or a ban loop is possible.
 ignorecommand =
 
 # Drop the offending packets, not just the connection.
 banaction = firewallcmd-rich-rules
-# Permanent. -1 means never expires.
-bantime = -1
-# Ignore a ban if the jail has been up less than this (avoids banning during
-# a service restart that briefly looks like a spray).
+# CRITICAL: without this, the action inherits zone=public from
+# /etc/fail2ban/action.d/firewallcmd-common.conf (line 37) and writes every
+# ban into the 'public' zone. Since the workstation zone replaced public on
+# this machine, bans would be accepted, logged as success, and block nothing.
+# Pin the zone explicitly so the two stay in agreement.
+zone = workstation
+# 24 hours. Was -1 (never expires); see the note above.
+bantime = 86400
 findtime = 10m
 maxretry = 5
 
 # backend=auto tries only pyinotify/polling — it does NOT include systemd,
 # so a journalctl logpath was silently ignored. This system is journald-only:
-# no syslog-ng, no rsyslog, no /var/log/auth.log. systemd backend is required.
+# no syslog-ng, no rsyslog, no /var/log/auth.log. systemd backend required.
 backend = systemd
 usedns = no
 
-# ── SDDM / graphical login ────────────────────────────────────────────────
-# The real attack surface on a laptop: anyone who walks up to it, or reaches
-# it over the network, hits this.
-#
-# Uses the shipped `pam-generic` filter, NOT a dedicated `sddm` filter.
-# fail2ban-filter-sddm does not exist in the Arch repos; sddm authenticates
-# through PAM and emits the same failure lines pam-generic matches, so this
-# is equivalent coverage without an uninstallable dependency.
-[sddm]
-enabled  = true
-port     = sddm
-filter   = pam-generic
-# No logpath: with backend=systemd, logpath is not valid. Select via
-# journalmatch instead. _TRANSPORT=auth is where PAM denials land.
-journalmatch = _SYSTEMD_UNIT=sddm.service + _TRANSPORT=auth
-               _SYSTEMD_UNIT=sddm-greeter.service + _TRANSPORT=auth
-maxretry = 5
-bantime  = -1
-
-# ── sudo ──────────────────────────────────────────────────────────────────
-# Privilege-escalation attempts. Same reasoning: pam-generic, not a
-# fail2ban-filter-sudo that does not exist in the repos.
-[sudo]
-enabled  = true
-port     = sudo
-filter   = pam-generic
-journalmatch = _COMM=sudo + _TRANSPORT=auth
-maxretry = 4
-bantime  = -1
-
 # ── sshd ──────────────────────────────────────────────────────────────────
-# sshd is currently DISABLED on this machine, so this jail matches nothing
-# today. It is here so that if sshd is ever enabled, permanent protection is
-# already in place rather than forgotten.
+# sshd is DISABLED and the workstation zone blocks port 22, so this jail
+# matches nothing today. It is here so that if sshd is ever enabled, bans
+# are already in place rather than forgotten.
 [sshd]
 enabled  = true
 port     = ssh
 filter   = sshd
 journalmatch = _SYSTEMD_UNIT=sshd.service + _TRANSPORT=auth
 maxretry = 4
-bantime  = -1
+bantime  = 86400
 
 # ── Recidive ──────────────────────────────────────────────────────────────
-# Permanent ban for anyone who has already been banned. This is the jail
-# that makes "lock out repeat offenders forever" literal: a host that keeps
-# coming back after a ban gets banned at the firewall with no expiry.
+# Re-bans repeat offenders: a host that keeps coming back after a 24h ban
+# earns another 24h. findtime=1d means "3 strikes inside 24h".
 [recidive]
-# ⚠ BOOTSTRAP ORDER MATTERS. recidive reads /var/log/fail2ban.log — fail2ban's
-# OWN log. On a machine where fail2ban has never run, that file does not exist,
-# and fail2ban ABORTS THE ENTIRE STARTUP with:
+# ENABLED as of 2026-09-26 — enabled deliberately on this machine, not drift.
+# The bootstrap below was completed, so the config is now the steady state and
+# the repo matches what is live.
+#
+# ⚠ STILL REQUIRED ON A FRESH MACHINE. recidive reads /var/log/fail2ban.log —
+# fail2ban's OWN log. Where fail2ban has never run, that file does not exist and
+# fail2ban ABORTS THE ENTIRE STARTUP with:
 #
 #     ERROR  Have not found any log file for 'recidive' jail.
 #
-# which leaves the other three jails dead too. So recidive ships DISABLED here.
-# Enable it on the SECOND start, once the log exists:
+# which leaves every other jail dead too. So on any NEW machine, do this first:
 #
-#   sudo systemctl start fail2ban                 # first start, creates the log
-#   sudo sed -i 's/^enabled  = false/enabled  = true/' /etc/fail2ban/jail.d/shield-kitty.local
-#   sudo systemctl restart fail2ban                # now recidive can read it
+#   1. deploy this file with 'enabled = false'
+#   2. sudo systemctl start fail2ban      # first start, creates the log
+#   3. sudo sed -i 's/^enabled  = false/enabled  = true/' \
+#            /etc/fail2ban/jail.d/shield-kitty.conf
+#   4. sudo systemctl restart fail2ban
 #
-enabled  = false
+# Preconditions verified on this machine before enabling:
+#   /var/log/fail2ban.log  exists (root:root 0600, 34K)
+#   loglevel               INFO in /etc/fail2ban/fail2ban.conf
+#                         (below WARNING, recidive never sees the Ban events
+#                          it exists to count, and fails silently)
+#   backend/logpath        polling + the file above, since the systemd journal
+#                          does not carry fail2ban's own log
+enabled  = true
 port     = all
 filter   = recidive
 # recidive must read fail2ban's own FILE log — the systemd journal does not
-# contain it. Enable this only after fail2ban has run once and created
-# /var/log/fail2ban.log. It also needs a non-systemd backend override.
+# contain it. Needs a non-systemd backend override.
 backend = polling
 logpath  = /var/log/fail2ban.log
 maxretry = 3
 findtime = 1d
-bantime  = -1
+bantime  = 86400
