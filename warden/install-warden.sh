@@ -79,6 +79,31 @@ cmd_install() {
         install -Dm644 "$HERE/warden.json" /etc/warden/warden.json
         ok "created /etc/warden/warden.json from template"
     fi
+
+    # With threshold_hits=1 and no owners, EVERY device is unverified -- which
+    # includes the user's own phone and laptop. That is the intended default
+    # policy, but starting in that state without noticing it looks like a
+    # bug ("it banned my phone"), so say it loudly and stop for confirmation.
+    OWNERS=$(python3 -c "
+import json,re,sys
+c=json.load(open('/etc/warden/warden.json'))
+ok=[o for o in (c.get('owners') or [])
+    if re.fullmatch(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', o.get('mac',''))]
+print(len(ok))
+" 2>/dev/null || echo 0)
+    if [ "${OWNERS:-0}" -eq 0 ]; then
+        printf '\n\033[33m  WARNING: no devices are registered as yours.\033[0m\n'
+        printf '  With threshold_hits=1, the FIRST inbound attempt from ANY device\n'
+        printf '  is a ban -- including your own phone and laptop. They will be\n'
+        printf '  blocked, and a randomised-MAC phone is blocked permanently.\n\n'
+        printf '  This is the policy you asked for, and it is installed as-is.\n'
+        printf '  To enrol your devices, either:\n'
+        printf '    a) run  sudo systemctl start warden  now, use your phone, then\n'
+        printf '       sudo warden suggest   and copy the MACs into /etc/warden/warden.json\n'
+        printf '    b) or add them to /etc/warden/warden.json FIRST, then install.\n\n'
+    else
+        ok "ownership registry has $OWNERS device(s) enrolled"
+    fi
     install -d -m 0750 /var/lib/warden
     install -d -m 0750 /var/log/warden
     # the daemon runs as root and writes both; make them root-owned
@@ -94,12 +119,20 @@ table inet warden {
         size 4096
         flags timeout
     }
+    set blacklist_mac {
+        type ether_addr
+        size 4096
+        flags timeout
+    }
     chain input {
         type filter hook input priority -150; policy accept;
         iif lo accept
         ct state established,related accept
         meta l4proto ipv6-icmp accept
-        ip saddr @blacklist counter drop comment "warden: blacklisted device"
+        # Ban the DEVICE first. On this flat 10.0.0.0/8 an address ban alone is
+        # worthless: the next host to take a different address walks back in.
+        ether saddr @blacklist_mac counter drop comment "warden: blacklisted MAC"
+        ip saddr @blacklist counter drop comment "warden: blacklisted address"
         iifname "$IFACE" ip  saddr 10.0.0.0/8   log group $GROUP prefix "WARDEN " limit rate 20/minute
         iifname "$IFACE" ip6 saddr != ::1        log group $GROUP prefix "WARDEN " limit rate 20/minute
     }

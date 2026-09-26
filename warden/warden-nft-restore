@@ -23,12 +23,20 @@ table inet warden {
         size 4096
         flags timeout
     }
+    set blacklist_mac {
+        type ether_addr
+        size 4096
+        flags timeout
+    }
     chain input {
         type filter hook input priority -150; policy accept;
         iif lo accept
         ct state established,related accept
         meta l4proto ipv6-icmp accept
-        ip saddr @blacklist counter drop comment "warden: blacklisted device"
+        # Ban the DEVICE first. On this flat 10.0.0.0/8 an address ban alone is
+        # worthless: the next host to take a different address walks back in.
+        ether saddr @blacklist_mac counter drop comment "warden: blacklisted MAC"
+        ip saddr @blacklist counter drop comment "warden: blacklisted address"
         iifname "$IFACE" ip  saddr 10.0.0.0/8   log group $GROUP prefix "WARDEN " limit rate 20/minute
         iifname "$IFACE" ip6 saddr != ::1        log group $GROUP prefix "WARDEN " limit rate 20/minute
     }

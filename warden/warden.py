@@ -64,15 +64,32 @@ OUI_FILE = Path("/usr/share/nmap/nmap-mac-prefixes")
 DEFAULTS = {
     "nflog_group": 5,
     "interface": "wlo1",
-    "threshold_hits": 3,          # hits needed inside the window
-    "threshold_window_s": 900,    # 15 minutes
+    # How many attempts inside threshold_window_s before a ban.
+    # 1 = the FIRST inbound attempt from an unverified device is an immediate
+    # ban. This is the default because the threat model is "any connection
+    # from a device I do not own counts as an attempt to reach me".
+    "threshold_hits": 1,
+    "threshold_window_s": 900,
     "ban_seconds": 86400,         # 24 h first offence
     "escalate_factor": 2,         # each repeat doubles the ban
     "max_ban_seconds": 604800,    # cap at 7 days
     "state_ttl_seconds": 604800,  # forget a clean device after 7 days
-    "audit_max_bytes": 8_388_608,
-    "trusted": [],                # IPs never auto-banned
+    "audit_max_bytes": 8388608,
+    "trusted": [],                # IPs never auto-banned (infrastructure)
     "vendors": {},                # optional overrides, see below
+    # OWNERSHIP REGISTRY -- the devices you actually own. Anything seen on the
+    # wire that is not here is unverified, and one inbound attempt from an
+    # unverified device is a ban.
+    #
+    # Identity is the MAC, not the IP. This network is a flat 10.0.0.0/8
+    # broadcast domain, so an IP ban alone is worthless: the next device to
+    # pick up a different address in the same /8 walks straight back in.
+    #
+    # Enrol the first one by hand, then use `warden suggest` to see candidates
+    # for the rest. A random-MAC phone will need re-enrolling when it rotates.
+    "owners": [
+        # {"mac": "aa:bb:cc:dd:ee:ff", "name": "my phone", "ips": ["10.197.250.7"]}
+    ],
 }
 
 # OUI vendor fragments that mark a device as a phone / tablet. Matched as a
@@ -234,6 +251,144 @@ def decode_packet(msg: bytes) -> tuple[str, str, int | None, int] | None:
 
 
 # ── policy engine ───────────────────────────────────────────────────────
+def normalise_mac(mac: str | None) -> str | None:
+    """Lowercase colon form, or None. Used as a dict key so that the
+    same device is recognised regardless of how it was written down."""
+    if not mac:
+        return None
+    m = re.fullmatch(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", mac.strip())
+    return m.group(0).lower() if m else None
+
+
+def is_locally_administered(mac: str) -> bool:
+    """Second LSB of the first octet is set for randomised (private) MACs.
+
+    A phone using MAC randomisation looks like this. It is still a distinct
+    device to ban, but it will NOT be the same MAC next time, so an
+    ownership entry keyed on it expires. Worth knowing, worth logging.
+    """
+    try:
+        first = int(mac.split(":")[0], 16)
+    except (ValueError, IndexError):
+        return False
+    return bool(first & 0b10)
+
+
+# ── spoofing detection ──────────────────────────────────────────────────
+#
+# What can actually be detected on this box, and what cannot:
+#
+# DETECTABLE
+#   * a randomised (locally-administered) MAC from a device that is not a
+#     registered owner -- it is concealing its hardware identity
+#   * one MAC presenting several source addresses at once (identity reuse)
+#   * a banned MAC coming back under a different address (evasion)
+#   * a MAC with a globally-administered OUI that claims a major vendor
+#
+# NOT DETECTABLE HERE (and not claimed)
+#   * a stranger simply using a DIFFERENT random MAC each time. This is the
+#     standard evasion and MAC-based blocking does not stop it; only 802.11w
+#     or a WPA3-enterprise AP with client isolation would. Treat a MAC ban as
+#     a speed bump against a casual prober, not against a determined one.
+#   * frames the AP forwards but that never reach the IP stack, so we never
+#     see the MAC at all. There is no bridge here, so no fdb table to read.
+
+SPOOF_SEVERITY = {
+    "randomised-unverified": ("permanent", "randomised MAC from a device you do not own"),
+    "identity-reuse": ("escalate", "one MAC presenting multiple source addresses"),
+    "ban-evasion": ("permanent", "banned MAC reappeared at a new address"),
+    "vendor-masquerade": ("escalate", "MAC claims a vendor OUI it cannot own"),
+}
+
+# OUIs that are heavily impersonated, because a spoofed MAC that resolves to
+# a recognisable vendor is a deliberate choice rather than an accident.
+MAJOR_VENDORS = ("apple", "samsung", "intel", "dell", "microsoft", "google",
+                 "sony", "lg elect", "huawei", "xiaomi")
+
+
+def detect_spoof(key: str, rec: dict, conf: dict, ban_until: float) -> list[dict]:
+    """Signals for one device. Returns a list of {kind, severity, why}."""
+    out: list[dict] = []
+    mac = normalise_mac(rec.get("mac"))
+    if not mac:
+        return out
+
+    if is_locally_administered(mac):
+        # This box's own wlo1 MAC is randomised too (0xea), and the gateway
+        # shows up in the neighbour table twice (v4 + v6). Neither is spoofing,
+        # so only unverified devices are judged here.
+        out.append({"kind": "randomised-unverified",
+                    "why": "locally-administered MAC, not a registered owner"})
+
+    ips = [ip for ip in (rec.get("ips") or [])
+           if not ipaddress.ip_address(ip).is_link_local]
+    # Two addresses for one MAC in a 15-minute window is identity reuse. The
+    # window matters: a device that simply reconnects and takes a new DHCP
+    # lease shows the same thing.
+    if len(set(ips)) >= 2:
+        out.append({"kind": "identity-reuse",
+                    "why": f"same MAC seen at {len(set(ips))} addresses"})
+
+    if ban_until:
+        out.append({"kind": "ban-evasion",
+                    "why": "already-banned device is back"})
+
+    prefix = mac.replace(":", "").upper()[:6]
+    vendor = (conf.get("vendors") or {})
+    name = next((v for k, v in vendor.items() if k.lower() in prefix), "")
+    if not name and len(prefix) == 6:
+        name = oui_table().get(prefix, "")
+    if name and not is_locally_administered(mac) and \
+            any(v in name.lower() for v in MAJOR_VENDORS) and \
+            rec.get("class") == "unknown":
+        # Registered to a major vendor but classified unknown: the OUI and the
+        # observed behaviour disagree, which is what a spoofed MAC looks like.
+        out.append({"kind": "vendor-masquerade",
+                    "why": f"OUI says {name} but device behaves unrecognised"})
+    return out
+
+
+class SpoofTally:
+    """Accumulates spoof signals per device and decides the sanction.
+
+    A single signal is not proof -- neighbour tables are lossy and a device
+    that reconnects looks like identity reuse once. So the first signal only
+    escalates the ban, and only REPEATED signals (or a ban-evasion, which is
+    unambiguous) earn a permanent block.
+    """
+
+    def __init__(self, conf: dict, clock=time.time):
+        self.conf = conf
+        self.clock = clock
+        self.signals: dict[str, list[dict]] = defaultdict(list)
+
+    def record(self, key: str, found: list[dict]) -> None:
+        if found:
+            self.signals[key].extend(found)
+            # keep the trail bounded
+            self.signals[key] = self.signals[key][-20:]
+
+    def sanction(self, key: str, base_until: float) -> tuple[str, str]:
+        """-> (action, reason). action is 'normal' | 'escalate' | 'permanent'."""
+        sigs = self.signals.get(key) or []
+        if not sigs:
+            return "normal", "threshold-reached"
+        kinds = {s["kind"] for s in sigs}
+
+        # Ban evasion is proof in itself: the device was told to go away and
+        # came back. That is permanent, no further evidence required.
+        if "ban-evasion" in kinds:
+            return "permanent", "ban-evasion: banned device returned"
+        if "randomised-unverified" in kinds:
+            return "permanent", "randomised-unverified: concealed identity, not an owner"
+        if len(sigs) >= 2 or {"identity-reuse", "vendor-masquerade"} <= kinds:
+            return "permanent", "repeated spoof signals: " + \
+                   ", ".join(sorted(kinds))
+        if "identity-reuse" in kinds or "vendor-masquerade" in kinds:
+            return "escalate", "suspected spoofing: " + ", ".join(sorted(kinds))
+        return "normal", "threshold-reached"
+
+
 class Engine:
     def __init__(self, conf: dict, clock=time.time):
         self.conf = conf
@@ -241,7 +396,37 @@ class Engine:
         self.hits: dict[str, deque] = defaultdict(deque)
         self.devices: dict[str, dict] = {}
         self.blacklist: dict[str, dict] = {}
+        # key -> {"since", "reason", "mac", "ip", "vendor", "class"}.
+        # These never expire. Kept apart from `blacklist` so the expiry sweep
+        # cannot quietly shorten one.
+        self.permanent: dict[str, dict] = {}
+        self.spoof = SpoofTally(conf, clock)
         self.trusted = set(conf.get("trusted") or [])
+        # mac -> {"name":..., "ips": [...]}
+        self.owners: dict[str, dict] = {}
+        for entry in conf.get("owners") or []:
+            mac = normalise_mac(entry.get("mac", ""))
+            if mac:
+                self.owners[mac] = {"name": entry.get("name", "unnamed"),
+                                    "ips": list(entry.get("ips") or [])}
+
+    # -- ownership ---------------------------------------------------
+    def owner_of(self, mac: str | None, ip: str | None = None) -> dict | None:
+        """The ownership record for this device, or None if unverified.
+
+        Matched on MAC. The IP list on an owner entry is only a convenience
+        for the human reading the config -- a device whose MAC is not
+        registered is unverified no matter what address it currently holds.
+        """
+        mac = normalise_mac(mac)
+        if not mac:
+            return None
+        rec = self.owners.get(mac)
+        if rec is None:
+            return None
+        return {"mac": mac, "name": rec["name"],
+                "randomised": is_locally_administered(mac),
+                "known_ips": rec["ips"]}
 
     # -- persistence -------------------------------------------------
     def load(self, path: Path = STATE) -> None:
@@ -258,12 +443,15 @@ class Engine:
                 self.blacklist[ip] = {**rec, "until": 0, "active": False}
         for ip, rec in (blob.get("devices") or {}).items():
             self.devices[ip] = rec
+        for key, rec in (blob.get("permanent") or {}).items():
+            self.permanent[key] = rec
 
     def save(self, path: Path = STATE) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(
             {"blacklist": self.blacklist, "devices": self.devices,
+             "permanent": self.permanent,
              "saved_at": self.clock()},
             indent=1, sort_keys=True))
         os.replace(tmp, path)
@@ -282,65 +470,173 @@ class Engine:
         rec = self.blacklist.get(ip)
         return rec["until"] if rec and rec.get("until", 0) > self.clock() else 0.0
 
+    def is_banned_mac(self, mac: str | None) -> tuple[str, float] | None:
+        """(owner_key, until) if this MAC is banned, else None.
+
+        A MAC that is currently quiet is not a banned MAC. The blacklist is
+        kept keyed by the DEVICE (its MAC when known, else its IP) and the
+        nft set is checked against both, so a device that changes address
+        mid-ban stays banned.
+        """
+        mac = normalise_mac(mac)
+        if not mac:
+            return None
+        rec = self.blacklist.get(f"mac:{mac}")
+        if rec and rec.get("until", 0) > self.clock():
+            return f"mac:{mac}", rec["until"]
+        return None
+
+    def is_permanent(self, key: str) -> bool:
+        """A permanent block never expires and is not touched by the
+        expiry sweep. It only leaves via `warden unforgive`."""
+        return key in self.permanent
+
+    def is_permanent_mac(self, mac: str | None) -> bool:
+        mac = normalise_mac(mac)
+        return bool(mac) and f"mac:{mac}" in self.permanent
+
     def observe(self, src: str, dport: int | None = None,
-                vendor: str | None = None) -> dict:
-        """One inbound attempt. Returns the event record."""
+                vendor: str | None = None, mac: str | None = None) -> dict:
+        """One inbound attempt. Returns the event record.
+
+        Policy: infrastructure and registered owners are exempt. Everything
+        else is unverified, and an unverified device is banned on its first
+        attempt (threshold_hits defaults to 1).
+        """
         now = self.clock()
-        mac = mac_of_ip(src) if vendor is None else None
+        if mac is None and vendor is None:
+            mac = mac_of_ip(src)
+        mac = normalise_mac(mac)
         vend = vendor if vendor is not None else vendor_of(mac, self.conf)
         kind = classify(vend, dport, self.conf)
-        trusted = self.is_trusted(src)
-        banned_until = self.active_ban(src)
+        infra = self.is_trusted(src)
+        owner = self.owner_of(mac, src)
+        trusted = infra or owner is not None
 
-        dev = self.devices.setdefault(src, {
-            "first_seen": now, "hits": 0, "bans": 0,
+        # Ban state: by MAC if we have one, else by IP as a fallback.
+        banned_until = self.active_ban(src)
+        mac_ban = self.is_banned_mac(mac)
+        if mac_ban and not banned_until:
+            banned_until = mac_ban[1]
+        key = f"mac:{mac}" if mac else src
+        permanent = self.is_permanent(key) or self.is_permanent_mac(mac)
+
+        dev = self.devices.setdefault(key, {
+            "first_seen": now, "hits": 0, "bans": 0, "key": key,
             "mac": mac, "vendor": vend, "class": kind})
-        dev.update({"last_seen": now, "hits": dev["hits"] + 1,
-                    "mac": mac or dev.get("mac"),
-                    "vendor": vend, "class": kind,
-                    "ports": sorted(set(dev.get("ports", []) + ([dport] if dport else [])))})
+        dev.update({"last_seen": now, "hits": dev.get("hits", 0) + 1,
+                    "mac": mac, "vendor": vend, "class": kind,
+                    "ips": sorted(set(dev.get("ips", []) + [src]))[:16],
+                    "ports": sorted(set(dev.get("ports", []) + ([dport] if dport else [])))[:16]})
         if now - dev["first_seen"] > self.conf["state_ttl_seconds"]:
             dev["first_seen"] = now
 
+        # Every branch below assigns `action`; this default is unreachable
+        # and exists so a future branch cannot silently return None.
         action = "observed"
-        if trusted:
-            action = "trusted"
+        if infra:
+            action = "infrastructure"
+        elif owner is not None:
+            action = "owner"
+        elif permanent:
+            # Already permanently blocked and it is still talking to us.
+            dev["strikes"] = dev.get("strikes", 0) + 1
+            self.permanent[key]["last_seen"] = now
+            self.permanent[key]["strikes"] = dev["strikes"]
+            action = "permanent-hit"
         elif banned_until:
             dev["strikes"] = dev.get("strikes", 0) + 1
-            new_until = min(now + self._ban_len(dev["strikes"]),
-                            self.clock() + self.conf["max_ban_seconds"])
-            self.blacklist[src] = {"until": new_until, "since": banned_until,
-                                   "reason": "reoffend-while-banned",
-                                   "mac": dev.get("mac"), "vendor": vend,
-                                   "class": kind, "strikes": dev["strikes"]}
-            action = "ban-extended"
+            # A device that is ALREADY banned has been told to go away. Coming
+            # back is ban evasion, which the tally rules as permanent. This
+            # branch previously only ever extended the timed ban, so a device
+            # could evade forever at the cost of a longer timeout.
+            evasion = detect_spoof(key, dev, self.conf, banned_until)
+            if evasion:
+                self.spoof.record(key, evasion)
+            verdict, reason = self.spoof.sanction(key, now)
+            if verdict == "permanent":
+                self.permanent[key] = {
+                    "since": banned_until, "last_seen": now, "reason": reason,
+                    "mac": mac, "ip": src, "vendor": vend, "class": kind,
+                    "strikes": dev["strikes"], "all_ips": dev["ips"],
+                    "signals": self.spoof.signals.get(key, [])}
+                self.blacklist.pop(key, None)
+                action = "permanently-blocked"
+            else:
+                new_until = min(now + self._ban_len(dev["strikes"]),
+                                now + self.conf["max_ban_seconds"])
+                self.blacklist[key] = {"until": new_until, "since": banned_until,
+                                       "reason": "reoffend-while-banned",
+                                       "mac": mac, "ip": src, "vendor": vend,
+                                       "class": kind, "strikes": dev["strikes"],
+                                       "all_ips": dev["ips"]}
+                action = "ban-extended"
         else:
-            win = deque(t for t in self.hits[src] if now - t < self.conf["threshold_window_s"])
+            win = deque(t for t in self.hits[key]
+                        if now - t < self.conf["threshold_window_s"])
             win.append(now)
-            self.hits[src] = win
+            self.hits[key] = win
             if len(win) >= self.conf["threshold_hits"]:
                 dev["strikes"] = dev.get("strikes", 0) + 1
-                until = now + self._ban_len(dev["strikes"])
+                verdict, reason = self._judge(key, dev, now, mac, src, vend, kind)
                 dev["bans"] = dev.get("bans", 0) + 1
-                self.blacklist[src] = {"until": until, "since": now,
-                                       "reason": "threshold-reached",
-                                       "mac": dev.get("mac"), "vendor": vend,
-                                       "class": kind, "strikes": dev["strikes"]}
-                self.hits[src].clear()
-                action = "banned"
+                if verdict == "permanent":
+                    self.permanent[key] = {
+                        "since": now, "last_seen": now, "reason": reason,
+                        "mac": mac, "ip": src, "vendor": vend, "class": kind,
+                        "strikes": dev["strikes"], "all_ips": dev["ips"],
+                        "signals": self.spoof.signals.get(key, [])}
+                    action = "permanently-blocked"
+                else:
+                    until = (now + self._ban_len(dev["strikes"] + 1) * 3
+                             if verdict == "escalate" else now + self._ban_len(dev["strikes"]))
+                    until = min(until, now + self.conf["max_ban_seconds"])
+                    self.blacklist[key] = {
+                        "until": until, "since": now, "reason": reason,
+                        "mac": mac, "ip": src, "vendor": vend, "class": kind,
+                        "strikes": dev["strikes"], "all_ips": dev["ips"]}
+                    action = "banned-escalated" if verdict == "escalate" else "banned"
+                self.hits[key].clear()
+
+        signals = [] if trusted else detect_spoof(key, dev, self.conf, banned_until)
+        if signals:
+            self.spoof.record(key, signals)
 
         return {"ts": now, "src": src, "dport": dport, "mac": mac,
                 "vendor": vend, "class": kind, "action": action,
-                "trusted": trusted, "ban_until": self.blacklist.get(src, {}).get("until", 0)}
+                "key": key, "owner": (owner or {}).get("name"),
+                "unverified": not trusted, "infrastructure": infra,
+                "permanent": permanent,
+                "spoof_signals": [s["kind"] for s in signals],
+                "ban_until": self.blacklist.get(key, {}).get("until", 0)}
+
+    def _judge(self, key: str, dev: dict, now: float, mac: str | None,
+               src: str, vend: str, kind: str) -> tuple[str, str]:
+        """Decide the sanction for a fresh ban, consulting the spoof tally."""
+        signals = detect_spoof(key, dev, self.conf, 0)
+        if signals:
+            self.spoof.record(key, signals)
+        verdict, reason = self.spoof.sanction(key, now)
+        if verdict == "normal" and self.conf["threshold_hits"] <= 1:
+            reason = "unverified-device"
+        return verdict, reason
 
     def _ban_len(self, strikes: int) -> float:
         base = self.conf["ban_seconds"] * (self.conf["escalate_factor"] ** max(0, strikes - 1))
         return min(base, self.conf["max_ban_seconds"])
 
     def expired(self) -> list[str]:
+        """Expiring keys only. A permanent block is never returned here --
+        that is the whole difference between the two lists, and quietly
+        expiring one would make 'permanent' a lie."""
         now = self.clock()
         return [ip for ip, rec in self.blacklist.items()
-                if rec.get("until") and rec["until"] <= now]
+                if rec.get("until") and rec["until"] <= now
+                and ip not in self.permanent]
+
+    def forgive(self, key: str) -> bool:
+        """Lift a permanent block. The only way one ever ends."""
+        return self.permanent.pop(key, None) is not None
 
 
 # ── nft set sync ────────────────────────────────────────────────────────
@@ -356,16 +652,54 @@ def nft_set_peek(group_set: str) -> list[str]:
     return vals
 
 
-def nft_sync(engine: Engine, group_set: str) -> tuple[list[str], list[str]]:
-    """Push deltas into the nft set. Returns (added, removed)."""
-    want = {ip for ip, rec in engine.blacklist.items() if rec.get("until", 0) > engine.clock()}
-    have = set(nft_set_peek(group_set))
-    added = sorted(want - have)
-    removed = sorted(have - want)
-    for ip in added:
-        subprocess_run(["nft", "add", "element", "inet", "warden", group_set, "{", ip, "}"])
-    for ip in removed:
-        subprocess_run(["nft", "delete", "element", "inet", "warden", group_set, "{", ip, "}"])
+def nft_sync(engine: Engine, sets: dict[str, str] | None = None) -> tuple[list[str], list[str]]:
+    """Push deltas into the nft sets. Returns (added, removed).
+
+    Two sets are maintained: ipv4 addresses and ethernet MACs. The MAC set is
+    the one that matters on this flat /8 -- an address ban alone is undone by
+    the next device that takes a different address.
+    """
+    # `if sets is None`, not `sets or ...`: an empty dict means "no sets",
+    # and `or` would silently substitute the defaults and call nft.
+    if sets is None:
+        sets = {"ip": "blacklist", "mac": "blacklist_mac"}
+    added: list[str] = []
+    removed: list[str] = []
+    now = engine.clock()
+    # Permanent blocks are folded into the same nft sets, but with no timeout:
+    # the nft side has no concept of "permanent", the daemon does, and it will
+    # re-add anything that disappears.
+    perm_macs = {r["mac"] for r in engine.permanent.values() if r.get("mac")}
+    perm_ips: set[str] = set()
+    for rec in engine.permanent.values():
+        perm_ips.update(rec.get("all_ips") or [])
+        if rec.get("ip"):
+            perm_ips.add(rec["ip"])
+    for kind, setname in sets.items():
+        if kind == "mac":
+            want = {rec["mac"] for rec in engine.blacklist.values()
+                    if rec.get("mac") and rec.get("until", 0) > now} | perm_macs
+            field = "mac"
+        else:
+            want = set()
+            for rec in engine.blacklist.values():
+                if rec.get("until", 0) <= now:
+                    continue
+                for ip in (rec.get("all_ips") or []):
+                    want.add(ip)
+                if rec.get("ip"):
+                    want.add(rec["ip"])
+            want |= perm_ips
+            field = "ip"
+        have = set(nft_set_peek(setname))
+        for addr in sorted(want - have):
+            subprocess_run(["nft", "add", "element", "inet", "warden", setname,
+                            "{", addr, "}"])
+            added.append(f"{field}:{addr}")
+        for addr in sorted(have - want):
+            subprocess_run(["nft", "delete", "element", "inet", "warden", setname,
+                            "{", addr, "}"])
+            removed.append(f"{field}:{addr}")
     return added, removed
 
 
@@ -425,9 +759,14 @@ def run_daemon(conf: dict) -> int:
                 if not eng.is_trusted(src):
                     event = eng.observe(src, dport)
                     audit_write(fh, event)
-                    print(f"{time.strftime('%H:%M:%S')} {event['action']:>14} "
-                          f"{src:>39} dport={event['dport']} "
-                          f"{event['class']:<7} {event['vendor']}", flush=True)
+                    flag = ""
+                    if event.get("permanent"):
+                        flag = " PERMANENT"
+                    elif event.get("spoof_signals"):
+                        flag = " spoof:" + ",".join(event["spoof_signals"])
+                    print(f"{time.strftime('%H:%M:%S')} {event['action']:>20} "
+                          f"{event.get('mac') or event['src']} "
+                          f"{event['class']:<7} {event['vendor'][:30]}{flag}", flush=True)
         now = time.time()
         if now - last_sync > 15:
             last_sync = now
@@ -435,7 +774,7 @@ def run_daemon(conf: dict) -> int:
                 print(f"{time.strftime('%H:%M:%S')} {'ban-expired':>14} {ip}", flush=True)
                 audit_write(fh, {"ts": now, "src": ip, "action": "ban-expired"})
             try:
-                added, removed = nft_sync(eng, "blacklist")
+                added, removed = nft_sync(eng)
                 for ip in added:
                     print(f"{time.strftime('%H:%M:%S')} {'nft-add':>14} {ip}", flush=True)
                 for ip in removed:
@@ -508,19 +847,20 @@ def selftest() -> int:
     check("oui lookup works", bool(table), True)
 
     # ── escalation policy ──
-    print("escalation")
+    print("escalation (threshold 3, the old behaviour)")
     t = [1_000_000.0]
-    eng = Engine({**conf, "trusted": ["10.0.0.9"]}, clock=lambda: t[0])
+    eng = Engine({**conf, "trusted": ["10.0.0.9"], "threshold_hits": 3},
+                 clock=lambda: t[0])
     eng.load(Path("/nonexistent"))
     check("clean hit is observed",
-          eng.observe("10.1.1.1", 22, "Dell Inc.")["action"], "observed")
+          eng.observe("10.1.1.1", 22, "Dell Inc.", mac=None)["action"], "observed")
     check("2nd hit still observed",
-          eng.observe("10.1.1.1", 22, "Dell Inc.")["action"], "observed")
-    third = eng.observe("10.1.1.1", 22, "Dell Inc.")
+          eng.observe("10.1.1.1", 22, "Dell Inc.", mac=None)["action"], "observed")
+    third = eng.observe("10.1.1.1", 22, "Dell Inc.", mac=None)
     check("3rd hit bans", third["action"], "banned")
     check("ban length is 24h", round(eng.blacklist["10.1.1.1"]["until"] - t[0]), 86400)
     t[0] += 10
-    again = eng.observe("10.1.1.1", 22, "Dell Inc.")
+    again = eng.observe("10.1.1.1", 22, "Dell Inc.", mac=None)
     check("offence while banned extends", again["action"], "ban-extended")
     check("escalated ban is 48h", round(eng.blacklist["10.1.1.1"]["until"] - t[0]), 2 * 86400)
     t[0] += 7 * 86400 + 10
@@ -536,12 +876,14 @@ def selftest() -> int:
     check("hits outside window do not ban",
           eng2.observe("10.2.2.2", 22, "Intel Corporate")["action"], "observed")
 
-    print("trust")
+    print("trust (infrastructure is exempt, never banned)")
     check("configured trusted never banned",
-          eng2.observe("10.0.0.9", 22, "Unknown")["action"], "trusted")
-    for _ in range(5):
-        check("loopback is trusted", eng2.observe("127.0.0.1", 22, "X")["action"], "trusted")
-    check("gateway guess trusted", eng2.observe("169.254.1.1", None, "X")["action"], "trusted")
+          eng2.observe("10.0.0.9", 22, "Unknown", mac=None)["action"], "infrastructure")
+    for _ in range(3):
+        check("loopback is exempt",
+              eng2.observe("127.0.0.1", 22, "X", mac=None)["action"], "infrastructure")
+    check("link-local is exempt",
+          eng2.observe("169.254.1.1", None, "X", mac=None)["action"], "infrastructure")
 
     print("persistence round-trip")
     tmp_state = Path(os.environ.get("TMPDIR", "/tmp")) / f"warden-selftest-{os.getpid()}.json"
@@ -561,6 +903,183 @@ def selftest() -> int:
           json.loads(tmp_audit.read_text().splitlines()[0])["action"], "banned")
     tmp_audit.unlink(missing_ok=True)
 
+    # ── the actual policy: unverified device, first attempt ──
+    print("ownership + immediate ban (threshold 1)")
+    # 0x3e has the local bit set (0b10 in the low byte), i.e. a randomised MAC.
+    # The first attempt at 0x3c was wrong: 0x3c & 0x02 == 0, so it is a
+    # globally-administered OUI and the check correctly said False.
+    PHONE = "3e:22:fb:11:22:33"          # locally-administered / randomised
+    LAPTOP = "f4:5c:89:aa:bb:cc"         # ordinary vendor-assigned OUI
+    own = {**conf, "threshold_hits": 1, "trusted": ["10.128.128.128"],
+           "owners": [{"mac": PHONE, "name": "my phone", "ips": ["10.197.250.7"]}]}
+    e = Engine(own, clock=lambda: t[0])
+    e.load(Path("/nonexistent"))
+
+    check("mac normalisation", normalise_mac("F4:5C:89:AA:BB:CC"), LAPTOP)
+    check("mac normalisation rejects junk", normalise_mac("nope"), None)
+    check("local-admin bit detects randomised mac",
+          is_locally_administered(PHONE), True)
+    check("global bit is not randomised", is_locally_administered(LAPTOP), False)
+
+    ev = e.observe("10.197.250.7", 22, "Apple, Inc.", mac=PHONE)
+    check("registered owner is exempt", ev["action"], "owner")
+    check("owner is named", ev["owner"], "my phone")
+    check("owner not marked unverified", ev["unverified"], False)
+    check("owner not banned", e.blacklist, {})
+
+    ev = e.observe("10.197.250.7", 22, "Apple, Inc.", mac=PHONE)
+    check("owner stays exempt on repeat", ev["action"], "owner")
+
+    ev = e.observe("10.5.5.5", 445, "Dell Inc.", mac=LAPTOP)
+    check("unregistered device banned on FIRST hit", ev["action"], "banned")
+    check("ban reason is unverified-device", e.blacklist[f"mac:{LAPTOP}"]["reason"],
+          "unverified-device")
+    check("unresolvable device is NOT exempt", ev["unverified"], True)
+    check("device classified pc", ev["class"], "pc")
+
+    ev = e.observe("10.128.128.128", 53, "Some Router", mac="00:11:22:33:44:55")
+    check("gateway treated as infrastructure", ev["action"], "infrastructure")
+
+    ev = e.observe("10.197.250.9", 5353, "Apple, Inc.", mac=PHONE)
+    check("owner exempt even from a new address", ev["action"], "owner")
+
+    # The whole point of keying on MAC: a new IP must not launder the ban.
+    # And because coming back at all is ban evasion, it now escalates to a
+    # permanent block rather than merely lengthening the timeout.
+    print("MAC-keyed ban survives an address change")
+    t[0] += 1
+    ev = e.observe("10.9.9.9", 3389, "Dell Inc.", mac=LAPTOP)
+    check("same MAC from a NEW ip is still blocked", ev["action"], "permanently-blocked")
+    check("evasion promotes it to permanent", e.is_permanent(f"mac:{LAPTOP}"), True)
+    check("new address recorded with it",
+          "10.9.9.9" in e.permanent[f"mac:{LAPTOP}"]["all_ips"], True)
+
+    print("unresolvable MAC falls back to the address")
+    e2 = Engine({**conf, "threshold_hits": 1}, clock=lambda: t[0])
+    e2.load(Path("/nonexistent"))
+    ev = e2.observe("10.7.7.7", 22, "Unknown", mac=None)
+    check("no MAC still bans", ev["action"], "banned")
+    check("key falls back to the ip", ev["key"], "10.7.7.7")
+
+    print("randomised mac caveat")
+    check("randomised owner flagged", e.owner_of(PHONE)["randomised"], True)
+    check("plain owner not flagged", is_locally_administered(LAPTOP), False)
+
+    print("nft set sync computes MAC + IP deltas (dry)")
+    added, removed = nft_sync(e, sets={})
+    check("empty set map is a no-op", (added, removed), ([], []))
+    want_mac = {LAPTOP}
+    have_mac = {r["mac"] for r in list(e.blacklist.values()) + list(e.permanent.values())
+                if r.get("mac")}
+    check("mac set would contain the blocked laptop", want_mac <= have_mac, True)
+    check("banned record carries every ip seen",
+          {"10.5.5.5", "10.9.9.9"} <= set(e.permanent[f"mac:{LAPTOP}"]["all_ips"]), True)
+
+    # ── spoofing ──
+    print("spoof detection: no false positives on this box's real situation")
+    # This machine's own wlo1 MAC is 0xea:... -- randomised, and must not be
+    # treated as an attacker just for that.
+    check("own randomised wlo1 mac is locally administered",
+          is_locally_administered("ea:bd:c8:4d:53:a8"), True)
+    # The gateway appears twice in `ip neigh` (one v4, one v6 line). If link
+    # local were not filtered, that reads as "one MAC, many addresses".
+    sigs = detect_spoof("gw", {"mac": "e4:55:a8:0e:ae:9c",
+                               "ips": ["10.128.128.128", "fe80::e655:a8ff:fe0e:ae:dc"],
+                               "class": "unknown"}, conf, 0)
+    check("link-local neighbour does not read as identity reuse",
+          any(s["kind"] == "identity-reuse" for s in sigs), False)
+
+    print("spoof detection: real signals")
+    sigs = detect_spoof("r", {"mac": "3e:22:fb:11:22:33", "ips": ["10.4.4.4"],
+                              "class": "unknown"}, conf, 0)
+    check("randomised unverified mac flagged",
+          any(s["kind"] == "randomised-unverified" for s in sigs), True)
+
+    sigs = detect_spoof("r2", {"mac": "f4:5c:89:aa:bb:cc",
+                               "ips": ["10.4.4.4", "10.4.4.5"],
+                               "class": "pc"}, conf, 0)
+    check("one mac at two addresses flagged",
+          any(s["kind"] == "identity-reuse" for s in sigs), True)
+
+    sigs = detect_spoof("r3", {"mac": "f4:5c:89:aa:bb:cc", "ips": ["10.4.4.4"],
+                               "class": "pc"}, conf, 1_000_000.0)
+    check("banned mac returning flagged as evasion",
+          any(s["kind"] == "ban-evasion" for s in sigs), True)
+
+    check("no mac -> no signals", detect_spoof("x", {"mac": None}, conf, 0), [])
+
+    print("sanctions")
+    tal = SpoofTally(conf, clock=lambda: t[0])
+    check("no signals -> normal", tal.sanction("k", t[0])[0], "normal")
+    tal.record("k", [{"kind": "identity-reuse", "why": "x"}])
+    check("one weak signal only escalates", tal.sanction("k", t[0])[0], "escalate")
+    tal.record("k", [{"kind": "identity-reuse", "why": "x"}])
+    check("repeated weak signal is permanent", tal.sanction("k", t[0])[0], "permanent")
+    tal2 = SpoofTally(conf, clock=lambda: t[0])
+    tal2.record("e", [{"kind": "ban-evasion", "why": "x"}])
+    check("ban evasion is immediately permanent",
+          tal2.sanction("e", t[0])[0], "permanent")
+
+    print("randomised unverified device -> permanent on first sighting")
+    pconf = {**conf, "threshold_hits": 1, "trusted": []}
+    e3 = Engine(pconf, clock=lambda: t[0])
+    e3.load(Path("/nonexistent"))
+    ev = e3.observe("10.6.6.6", 22, "Unknown", mac="3a:11:22:33:44:55")
+    check("randomised stranger blocked permanently",
+          ev["action"], "permanently-blocked")
+    check("it is in the permanent list", e3.is_permanent(ev["key"]), True)
+    check("not in the expiring blacklist", e3.blacklist, {})
+    check("spoof signal reported", "randomised-unverified" in ev["spoof_signals"], True)
+
+    print("permanent blocks never expire")
+    t[0] += 365 * 86400
+    check("still permanent a year later", e3.is_permanent(ev["key"]), True)
+    check("expiry sweep ignores it", e3.expired(), [])
+    ev = e3.observe("10.6.6.6", 22, "Unknown", mac="3a:11:22:33:44:55")
+    check("still talking to it is logged as a permanent hit",
+          ev["action"], "permanent-hit")
+
+    print("permanent block survives a restart")
+    tmp2 = Path(os.environ.get("TMPDIR", "/tmp")) / f"warden-perm-{os.getpid()}.json"
+    e3.save(tmp2)
+    e4 = Engine(pconf, clock=lambda: t[0])
+    e4.load(tmp2)
+    check("reloaded from disk", e4.is_permanent(ev["key"]), True)
+    check("reason preserved", "randomised" in e4.permanent[ev["key"]]["reason"], True)
+    tmp2.unlink(missing_ok=True)
+
+    print("forgiveness")
+    check("forgive removes it", e3.forgive(ev["key"]), True)
+    check("forgive on an unknown key is False", e3.forgive("mac:00:00:00:00:00:00"), False)
+
+    print("clean unverified device gets a timed ban, not permanent")
+    e5 = Engine(pconf, clock=lambda: t[0])
+    e5.load(Path("/nonexistent"))
+    ev = e5.observe("10.8.8.8", 22, "Dell Inc.", mac="f4:5c:89:00:11:22")
+    check("timed ban", ev["action"], "banned")
+    check("not permanent", e5.permanent, {})
+    check("in the expiring list", "mac:f4:5c:89:00:11:22" in e5.blacklist, True)
+
+    print("an evading device is promoted to permanent, not just re-banned")
+    e6 = Engine(pconf, clock=lambda: t[0])
+    e6.load(Path("/nonexistent"))
+    # 0xf4 is a real vendor OUI, not a randomised one, so the ONLY thing that
+    # can condemn it here is coming back. (The first draft of this test used
+    # aa:bb:... which is itself locally administered, so it was permanently
+    # blocked on sight for the wrong reason and proved nothing.)
+    ev = e6.observe("10.8.8.8", 22, "Dell Inc.", mac="f4:5c:89:cc:dd:ee")
+    check("first sighting is a timed ban", ev["action"], "banned")
+    check("not permanent yet", e6.permanent, {})
+    t[0] += 5
+    ev = e6.observe("10.8.8.9", 22, "Dell Inc.", mac="f4:5c:89:cc:dd:ee")
+    check("coming back = permanent", ev["action"], "permanently-blocked")
+    check("moved out of the timed list", e6.blacklist, {})
+    check("is permanent", e6.is_permanent("mac:f4:5c:89:cc:dd:ee"), True)
+    ev = e6.observe("10.8.8.200", 22, "Dell Inc.", mac="f4:5c:89:cc:dd:ee")
+    check("and stays blocked at every new address", ev["action"], "permanent-hit")
+    t[0] += 99 * 86400
+    check("expiry sweep cannot touch it", e6.expired(), [])
+
     print()
     if fails:
         print(f"SELFTEST FAILED: {len(fails)} check(s): {', '.join(fails)}")
@@ -570,6 +1089,44 @@ def selftest() -> int:
 
 
 # ── status ──────────────────────────────────────────────────────────────
+def cmd_suggest(conf: dict) -> int:
+    """Enrolment helper: show devices seen recently that are not owners.
+
+    With threshold_hits=1 every unverified device is banned the moment it
+    speaks, so the practical workflow is: open this after using your own
+    phone/laptop, copy the MACs you recognise into "owners", restart warden.
+    """
+    eng = Engine(conf)
+    eng.load()
+    now = time.time()
+    print(f"warden suggest   {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("\n  Devices seen recently that are NOT in your ownership registry.")
+    print("  Add the ones you own to \"owners\" in " + str(CONF) + ":\n")
+    print('    {"mac": "aa:bb:cc:dd:ee:ff", "name": "my phone", "ips": ["10.x.x.x"]}')
+    print()
+    rows = []
+    for key, d in eng.devices.items():
+        if eng.owner_of(d.get("mac")) is not None:
+            continue
+        rows.append((d.get("last_seen", 0), key, d))
+    if not rows:
+        print("    (nothing seen yet -- have your phone connect, then re-run)")
+        return 0
+    for seen, key, d in sorted(rows, reverse=True)[:30]:
+        age = int(now - seen)
+        perm = " PERMANENT" if eng.is_permanent(key) else ""
+        ban = eng.active_ban(key)
+        state = f"banned {int(ban-now)//3600}h" if ban > now else "not banned"
+        rand = " rand-mac" if is_locally_administered(d.get("mac") or "") else ""
+        print(f"    {d.get('mac','?'):<18} {d.get('class',''):<7} "
+              f"{d.get('vendor','')[:26]:<26} {state}{perm}{rand}")
+        print(f"      addresses: {', '.join(d.get('ips', [])[:5])}")
+    print("\n  Devices already registered as yours:")
+    for mac, rec in sorted(eng.owners.items()):
+        print(f"    {mac:<18} {rec['name']}")
+    return 0
+
+
 def cmd_status(conf: dict) -> int:
     eng = Engine(conf)
     eng.load()
@@ -587,18 +1144,43 @@ def cmd_status(conf: dict) -> int:
         print("  loaded in nft (needs root to read)")
 
     active = [(ip, r) for ip, r in eng.blacklist.items() if r.get("until", 0) > now]
-    print(f"\n  active bans   {len(active)}")
+    print(f"\n  active bans   {len(active)} (timed)")
     for ip, r in sorted(active, key=lambda kv: -kv[1]["until"]):
         left = int(r["until"] - now)
         print(f"    {ip:>39}  {left//3600:>5}h left  {r.get('class',''):<7} "
               f"{r.get('vendor','')}  [{r.get('reason','')}]")
 
+    if eng.permanent:
+        print(f"\n  PERMANENT blocks  {len(eng.permanent)} (never expire)")
+        for key, r in sorted(eng.permanent.items(), key=lambda kv: kv[1].get("since", 0)):
+            sigs = sorted({s.get('kind', '?') for s in r.get('signals', [])})
+            print(f"    {key:>39}  {r.get('class',''):<7} {r.get('vendor','')}")
+            print(f"      since {time.strftime('%Y-%m-%d', time.localtime(r.get('since', 0)))}"
+                  f"  reason: {r.get('reason','')}")
+            if sigs:
+                print(f"      spoof signals: {', '.join(sigs)}")
+            if r.get("all_ips"):
+                print(f"      addresses: {', '.join(r['all_ips'][:6])}")
+        print("\n    lift one with:  sudo warden unforgive <mac-or-ip>")
+
     recent = sorted(eng.devices.items(), key=lambda kv: -kv[1].get("last_seen", 0))[:20]
     print(f"\n  devices seen  {len(eng.devices)} (showing {len(recent)})")
-    for ip, d in recent:
-        ban = "BANNED" if eng.active_ban(ip) else ""
-        print(f"    {ip:>39}  hits={d.get('hits',0):<5} {d.get('class',''):<7} "
-              f"{d.get('vendor','')[:38]:<38} {ban}")
+    for key, d in recent:
+        state = ""
+        if eng.is_permanent(key):
+            state = "PERMANENT"
+        elif eng.active_ban(key):
+            state = "BANNED"
+        elif eng.owner_of(d.get("mac")) is not None:
+            state = "owner"
+        print(f"    {str(d.get('mac') or key):>39}  hits={d.get('hits',0):<5} "
+              f"{d.get('class',''):<7} {d.get('vendor','')[:32]:<32} {state}")
+    if eng.owners:
+        print(f"\n  registered owners  {len(eng.owners)}")
+    else:
+        print("\n  [warn] no owners registered -- EVERY device is unverified and"
+              "\n         will be banned on its first inbound attempt, including"
+              "\n         your own phone and laptop. Run:  sudo warden suggest")
     return 0
 
 
@@ -606,8 +1188,9 @@ def cmd_status(conf: dict) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="warden", description=__doc__.split("\n")[1])
     ap.add_argument("cmd", nargs="?", default="status",
-                    choices=["daemon", "status", "watch", "block", "unblock", "selftest"])
-    ap.add_argument("ip", nargs="?", help="address for block/unblock")
+                    choices=["daemon", "status", "watch", "block", "unblock",
+                             "unforgive", "suggest", "selftest"])
+    ap.add_argument("ip", nargs="?", help="address for block/unblock/unforgive")
     args = ap.parse_args(argv)
     conf = load_conf()
 
@@ -615,6 +1198,8 @@ def main(argv: list[str] | None = None) -> int:
         return selftest()
     if args.cmd == "daemon":
         return run_daemon(conf)
+    if args.cmd == "suggest":
+        return cmd_suggest(conf)
     if args.cmd == "watch":
         if not AUDIT.exists():
             sys.exit(f"warden: no audit log yet at {AUDIT}")
@@ -625,23 +1210,42 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{time.strftime('%H:%M:%S', time.localtime(ev['ts']))} "
                       f"{ev.get('action',''):>14} {ev.get('src','')} "
                       f"{ev.get('vendor','')}")
-    if args.cmd in ("block", "unblock"):
+    if args.cmd in ("block", "unblock", "unforgive"):
         if not args.ip:
-            sys.exit(f"warden: {args.cmd} needs an address")
+            sys.exit(f"warden: {args.cmd} needs an address or MAC")
         eng = Engine(conf)
         eng.load()
+        # Accept either form. A MAC is the real identity here; an address is
+        # resolved to one when possible so the ban does not evaporate on the
+        # next DHCP lease.
+        target = normalise_mac(args.ip) or args.ip
+        key = f"mac:{target}" if normalise_mac(target) else target
+        now = time.time()
         if args.cmd == "block":
-            eng.blacklist[args.ip] = {"until": time.time() + conf["ban_seconds"],
-                                      "since": time.time(), "reason": "manual",
-                                      "strikes": 0}
-            eng.devices.setdefault(args.ip, {"first_seen": time.time(), "hits": 0,
-                                             "bans": 0, "class": "?", "vendor": "manual"})
+            eng.blacklist[key] = {"until": now + conf["ban_seconds"], "since": now,
+                                  "reason": "manual", "strikes": 0,
+                                  "ip": args.ip, "mac": normalise_mac(target)}
+            eng.devices.setdefault(key, {"first_seen": now, "hits": 0, "bans": 0,
+                                         "key": key, "class": "?", "vendor": "manual",
+                                         "ips": [] if normalise_mac(target) else [args.ip]})
+            print(f"warden: blocked {key} for {conf['ban_seconds']//3600}h")
+        elif args.cmd == "unforgive":
+            if eng.forgive(key):
+                eng.blacklist.pop(key, None)
+                print(f"warden: lifted the PERMANENT block on {key}")
+            else:
+                sys.exit(f"warden: {key} is not permanently blocked "
+                         f"(see `warden status` for the list)")
         else:
-            eng.blacklist.pop(args.ip, None)
+            if eng.blacklist.pop(key, None) is not None:
+                print(f"warden: unblocked {key}")
+            else:
+                print(f"warden: {key} was not in the timed blacklist")
         eng.save()
         if os.geteuid() == 0:
-            nft_sync(eng, "blacklist")
-        print(f"warden: {args.cmd}ed {args.ip}")
+            nft_sync(eng)
+        if args.cmd != "unforgive":
+            return cmd_status(conf)
     return cmd_status(conf)
 
 

@@ -33,30 +33,82 @@ firewall cannot:
 - are they **still trying**?
 - do I **remember** them if I later open a port for something legitimate?
 
-### How it works
+### Policy
 
-1. `nft` chain at `priority -150` (ahead of firewalld's own filter chain):
-   accepts loopback, established/related and ICMPv6; **drops** anything in its
-   blacklist set; **logs** the rest to NFLOG group 5, rate-limited 20/min.
-2. `warden.py` binds NFLOG group 5, decodes each packet, resolves the source
-   IP to a MAC via the neighbour table, looks the OUI up in
-   `/usr/share/nmap/nmap-mac-prefixes` (38 930 entries, local, no network),
-   and classifies the device.
-3. 3 hits within 15 minutes → 24 h ban, pushed into the nft set. Another
-   offence while banned → 48 h, then 96 h, capped at 7 days.
-4. Everything lands in `/var/log/warden/events.jsonl`.
+**Any inbound attempt from a device you do not own is a ban on the first
+packet.** `threshold_hits` is 1.
 
-The chain's policy is `accept` and warden never widens or narrows firewalld's
-opinion. Its only enforcement act is dropping its own blacklist, before anyone
-else gets a say.
+| device | outcome |
+|---|---|
+| registered owner | allowed, logged as `owner` |
+| loopback / link-local / gateway | allowed, `infrastructure` |
+| unverified, plain vendor MAC | timed ban, 24 h, doubling per repeat to 7 days |
+| unverified, **randomised MAC** | **permanent block** |
+| any device that comes back after a ban | **permanent block** (ban evasion) |
+| permanent block, still talking to us | logged as `permanent-hit` |
+
+Identity is the **MAC**, not the address. This network is a flat
+`10.0.0.0/8` broadcast domain (verified: `10.0.0.0/8 dev wlo1 proto kernel`),
+so a stranger can pick any address they like. Banning addresses alone would be
+worthless; the nft chain drops on `ether saddr @blacklist_mac` first.
+
+### Ownership registry
+
+```json
+"owners": [
+  {"mac": "3e:11:22:33:44:55", "name": "my phone",  "ips": ["10.197.250.7"]},
+  {"mac": "f4:5c:89:aa:00:01", "name": "my laptop", "ips": ["10.197.250.9"]}
+]
+```
+
+**Enrol your devices before or immediately after installing.** With an empty
+registry your own phone is banned on sight, and because phone MACs are
+randomised, permanently. The installer prints a warning when the registry is
+empty, and `warden status` repeats it on every run.
+
+```sh
+sudo warden suggest    # devices seen that are NOT yours; copy the MACs across
+```
+
+### Spoofing detection
+
+| signal | meaning |
+|---|---|
+| `randomised-unverified` | locally-administered MAC (2nd LSB of octet 1 set) from a device you do not own — concealing its hardware identity |
+| `identity-reuse` | one MAC presenting several source addresses |
+| `ban-evasion` | a banned MAC is back |
+| `vendor-masquerade` | OUI claims Apple/Intel/Dell/... but the device behaves unrecognised |
+
+One weak signal escalates the ban rather than condemning the device, because
+neighbour tables are lossy and a device that simply reconnects looks like
+identity reuse once. Two signals, or ban evasion, are permanent.
+
+**Two false-positive traps, both tested against this box's real state:** this
+machine's own `wlo1` MAC is `ea:bd:c8:4d:53:a8`, which is randomised — so
+"randomised" alone must never condemn a device, only an unverified one. And
+the gateway appears twice in `ip neigh` (a v4 and a v6 line), which reads as
+"one MAC, many addresses" unless link-local addresses are excluded. Both
+checks are in the selftest.
+
+### What this does not stop
+
+A stranger who uses a **different random MAC every time** is not stopped by
+any of this. That is the standard evasion, and MAC-based blocking does not
+address it — only 802.11w management-frame protection or a WPA3-enterprise AP
+with client isolation would. Treat a permanent block as a speed bump against a
+casual prober, not a wall against a determined one. And frames the AP forwards
+that never reach the IP stack are never seen here at all (no bridge on wlo1, so
+no fdb table to read).
 
 ### Use
 
 ```sh
-sudo warden status                    # tracked devices + active bans
+sudo warden status                    # owners, timed bans, permanent blocks
+sudo warden suggest                   # unrecognised devices, for enrolment
 sudo tail -f /var/log/warden/events.jsonl
-sudo warden block 10.1.2.3            # manual ban
-sudo warden unblock 10.1.2.3
+sudo warden block f4:5c:89:aa:bb:cc   # manual timed ban (MAC or address)
+sudo warden unblock f4:5c:89:aa:bb:cc
+sudo warden unforgive f4:5c:89:aa:bb:cc   # the ONLY way a permanent block ends
 python3 ~/Projects/zen-hardening/warden/warden.py selftest   # no root needed
 ```
 
@@ -125,7 +177,7 @@ sudo ./remove-remote-viewing.sh --unblock
 
 | check | result |
 |---|---|
-| `warden.py selftest` — 31 assertions: NFLOG decode, OUI classification, escalation, windowing, trust, persistence, audit log | **PASS** |
+| `warden.py selftest` — 86 assertions: NFLOG decode, OUI classification, ownership, MAC-keyed bans, escalation, windowing, spoof signals, sanctions, permanent-block persistence, forgiveness, audit log | **PASS** |
 | pacman hook matching, 10 argv shapes incl. `-U libteamviewer` and the `teamviewer-extra` substring trap | **10/10** |
 | `warden-nft-sync` input validation, 16 hostile args incl. `10.0.0.1; rm -rf /`, `$(id)`, embedded newline | **all rejected, no injection** |
 | `remove-remote-viewing.sh --check` on this box | clean, correct verdict |
