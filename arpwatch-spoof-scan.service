@@ -2,25 +2,33 @@
 Description=Scan arpwatch datafile for ARP spoofing
 Documentation=file://%h/Projects/zen-hardening/arpwatch-spoof-scan.sh
 After=arpwatch-spoof.service
+Requires=arpwatch-spoof.service
 
 [Service]
 Type=oneshot
 
-# Run as the desktop user, NOT root.
+# Runs as root, on purpose.
 #
-# With no User= this unit inherited root, and the scanner's session bootstrap
-# then resolved XDG_RUNTIME_DIR to /run/user/0 -- a bus that does not exist --
-# so notifications would fail silently while the scan itself looked healthy.
-# Running as the user whose Shield Kitty is actually on the bus is the point.
-User=livings
-Group=livings
-
-# Be explicit instead of trusting the bootstrap: a system unit gets none of
-# these. /run/user/1000 is correct whenever the user is logged in, and the
-# bootstrap is retained only as a fallback for odd environments.
+# Two things need it. arpwatch only rewrites arp.dat every 15 minutes
+# (SIGNALS, arpwatch(8)), and signalling the root-owned collector requires
+# CAP_KILL, so the scan has to be privileged to force a fresh flush. Scanning a
+# stale file on a 2-minute timer would re-read the same 15-minute-old data seven
+# times over.
+#
+# Running as root is safe for notifications ONLY because the session bus is
+# passed explicitly below. The original unit had no User=, so it inherited root
+# and the scanner's bootstrap derived XDG_RUNTIME_DIR from its own uid, giving
+# /run/user/0 -- a bus that does not exist. Notifications failed silently while
+# the scan reported healthy. Pinning the bus to the desktop user's runtime dir
+# decouples "privileged" from "which session do I notify".
 Environment=HOME=/home/livings
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+# Force arpwatch to flush arp.dat now instead of waiting up to 15 minutes.
+# The ';' keeps a missing pidfile from failing the unit, and the sleep gives it
+# time to finish the write before the scanner reads.
+ExecStartPre=/bin/sh -c 'kill -HUP "$(cat /run/arpwatch-spoof.pid 2>/dev/null)" 2>/dev/null; sleep 1'
 
 ExecStart=/home/livings/Projects/zen-hardening/arpwatch-spoof-scan.sh
 NoNewPrivileges=true
@@ -30,5 +38,4 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 ProtectSystem=full
 ProtectHome=read-only
-# The scanner only needs to read arp.dat and rewrite its own dedup state.
 ReadWritePaths=/var/lib/arpwatch /var/log

@@ -12,6 +12,12 @@ Wants=network-online.target
 #   -F  stay in the foreground; systemd wants the process, not a fork
 #   -i  interface (3.9 syntax)
 #   -f  datafile the scanner reads
+#   -D  arpdir: this build's compiled-in default is /usr/arpwatch, which does
+#      not exist, so it logged a chdir warning and fell back to the working
+#      directory. The package ships ethercodes.dat (the MAC vendor database) in
+#      /var/lib/arpwatch, so without -D the vendor lookups in reports silently
+#      resolve to nothing.
+#   -P  pidfile, so the scan timer can SIGHUP this exact process
 #   -s  no email reports; there is no MTA here and it would queue forever
 #   -N  no bogon reports  -- important on a /8, where most traffic looks odd
 #   -z  no 0.0.0.0 reports -- arpwatch(8) recommends this for busy DHCP networks
@@ -22,7 +28,11 @@ Wants=network-online.target
 # which makes the man page wrong rather than the flag obscure. Verified by
 # running each letter. install-arpwatch-spoof.sh now parse-checks this command
 # so a bad flag cannot ship again.
-ExecStart=/usr/sbin/arpwatch -F -i wlo1 -f /var/lib/arpwatch/arp.dat -s -N -z
+#
+# arpwatch only writes arp.dat every 15 minutes (SIGNALS in arpwatch(8)), so
+# the scan timer SIGHUPs this pid before reading. Without that the scanner would
+# re-read the same stale file on every tick.
+ExecStart=/usr/sbin/arpwatch -F -i wlo1 -f /var/lib/arpwatch/arp.dat -D /var/lib/arpwatch -P /run/arpwatch-spoof.pid -s -N -z
 Restart=on-failure
 RestartSec=30
 
@@ -31,7 +41,6 @@ RestartSec=30
 # working directory. For a system unit that is /. Point it at the real state
 # directory so the fallback is harmless and the warning stops.
 WorkingDirectory=/var/lib/arpwatch
-
 # Needs the raw socket only. Runs as root because pcap_bind needs it; the
 # datafile is what the unprivileged scanner reads.
 NoNewPrivileges=true

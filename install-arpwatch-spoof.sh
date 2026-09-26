@@ -17,6 +17,7 @@ DRY=0
 
 IFACE="${BDE_IFACE:-wlo1}"
 DB=/var/lib/arpwatch/arp.dat
+PIDFILE=/run/arpwatch-spoof.pid
 LOG=/var/log/arpwatch-spoof.log
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -39,7 +40,7 @@ UNIT_DST_DIR=/etc/systemd/system
 
 # Keep in one place and shared with the unit via the parse-check below, so the
 # two cannot drift. -q is deliberately absent: see arpwatch-spoof.service.
-ARPWATCH_ARGS="-F -i $IFACE -f $DB -s -N -z"
+ARPWATCH_ARGS="-F -i $IFACE -f $DB -D /var/lib/arpwatch -P $PIDFILE -s -N -z"
 
 # The parse probe must not touch the real datafile, and it must be bounded.
 #
@@ -49,6 +50,7 @@ ARPWATCH_ARGS="-F -i $IFACE -f $DB -s -N -z"
 # install hung on a perfectly healthy arpwatch. timeout 3 caps it, and exit 124
 # then means "still running", i.e. the flags were accepted.
 ARPWATCH_PROBE_DB="$(mktemp -u)/probe.dat"
+ARPWATCH_PROBE_PID="$(mktemp -u)/probe.pid"
 mkdir -p "$(dirname "$ARPWATCH_PROBE_DB")"
 
 run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
@@ -86,7 +88,7 @@ fi
 # loop, twice, because the failure only shows up in the journal.
 if command -v arpwatch >/dev/null 2>&1; then
     probe_out=""
-    if probe_out="$(timeout 3 arpwatch -F -i "$IFACE" -f "$ARPWATCH_PROBE_DB" -s -N -z 2>&1)"; then
+    if probe_out="$(timeout 3 arpwatch -F -i "$IFACE" -f "$ARPWATCH_PROBE_DB" -D /var/lib/arpwatch -P "$ARPWATCH_PROBE_PID" -s -N -z 2>&1)"; then
         probe_rc=0
     else
         probe_rc=$?
@@ -115,7 +117,7 @@ run sudo install -d -m 0755 -o root -g root /var/lib/arpwatch
 # when absent. Truncating it here destroyed every address already collected,
 # and on a re-run it was truncating a file the running service was appending to.
 if [ -f "$DB" ]; then
-    echo "    existing $DB preserved ($(wc -l <"$DB" 2>/dev/null || echo '?' entries)"
+    echo "    existing $DB preserved ($(wc -l <"$DB" 2>/dev/null || echo '?') entries)"
 else
     run sudo install -m 0644 -o root -g root /dev/null "$DB"
     echo "    created empty $DB"
