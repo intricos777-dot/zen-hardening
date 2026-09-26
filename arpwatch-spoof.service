@@ -1,0 +1,33 @@
+[Unit]
+Description=ARP spoof watcher (arpwatch -> Shield Kitty notification)
+Documentation=file://%h/Projects/zen-hardening/arpwatch-spoof-alert.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# arpwatch must start as root to open the AF_PACKET raw socket, then drop to
+# `livings` with -u. That drop is what makes the exec hook work: the hook calls
+# notify-send, which needs the USER's session bus. Running the hook as root
+# would silently deliver the alert to nobody. Do not add User= here -- it would
+# stop the raw socket from opening at all.
+#
+# Both writable paths are owned by livings, because after the drop that is who
+# arpwatch is: the database and the log. The database is in /var/lib rather than
+# ~ so that ProtectHome=read-only below still applies.
+ExecStart=/usr/sbin/arpwatch -q -u livings -c /var/lib/arpwatch/arpwatch.dat -a /home/livings/Projects/zen-hardening/arpwatch-spoof-alert.sh wlo1
+Restart=on-failure
+RestartSec=10
+
+ReadWritePaths=/var/lib/arpwatch /var/log
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ProtectSystem=full
+# The hook only READS the alert script from ~, so this stays on.
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
