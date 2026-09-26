@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# warden-nft-restore -- (re)create the inet warden table if it is missing.
+#
+# Runs as ExecStartPre. firewalld owns its own tables and does not touch ours,
+# but `nft flush ruleset`, a firewalld restart during an upgrade, or a manual
+# edit can all leave the box with no warden chain. Self-healing is better than
+# silently watching nothing.
+set -euo pipefail
+
+GROUP="${WARDEN_NFLOG_GROUP:-5}"
+IFACE="${WARDEN_IFACE:-wlo1}"
+
+if nft list table inet warden >/dev/null 2>&1; then
+    echo "warden-nft-restore: table inet warden already present, leaving it alone"
+    exit 0
+fi
+
+echo "warden-nft-restore: table inet warden absent, recreating"
+nft -f - <<EOF
+table inet warden {
+    set blacklist {
+        type ipv4_addr
+        size 4096
+        flags timeout
+    }
+    chain input {
+        type filter hook input priority -150; policy accept;
+        iif lo accept
+        ct state established,related accept
+        meta l4proto ipv6-icmp accept
+        ip saddr @blacklist counter drop comment "warden: blacklisted device"
+        iifname "$IFACE" ip  saddr 10.0.0.0/8   log group $GROUP prefix "WARDEN " limit rate 20/minute
+        iifname "$IFACE" ip6 saddr != ::1        log group $GROUP prefix "WARDEN " limit rate 20/minute
+    }
+}
+EOF
+
+# Restore anything still under ban in the state file.
+/usr/local/sbin/warden-nft-sync sync || echo "warden-nft-restore: set resync skipped"
+echo "warden-nft-restore: done"

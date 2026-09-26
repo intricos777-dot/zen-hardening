@@ -1,0 +1,38 @@
+[Unit]
+Description=warden - auto-blacklist PCs and phones that connect to this box
+Documentation=file:///home/livings/Projects/zen-hardening/warden/README.md
+After=network-online.target firewalld.service
+Wants=network-online.target
+# nft rules are gone across a reload; put them back before watching.
+# The daemon also re-syncs the set from state every 15s, so a missed reload
+# self-heals rather than leaving a stale ruleset.
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/warden-nft-restore
+ExecStart=/usr/local/sbin/warden daemon
+Restart=on-failure
+RestartSec=10
+
+# Binding NETLINK_NETFILTER group 5 and writing the nft set both need root.
+# This is the one privileged piece of the tool.
+User=root
+
+# It only ever needs the netlink socket, nft(8) and its own state.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/warden /var/log/warden
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

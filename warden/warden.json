@@ -1,0 +1,13 @@
+{
+ "nflog_group": 5,
+ "interface": "wlo1",
+ "threshold_hits": 3,
+ "threshold_window_s": 900,
+ "ban_seconds": 86400,
+ "escalate_factor": 2,
+ "max_ban_seconds": 604800,
+ "state_ttl_seconds": 604800,
+ "audit_max_bytes": 8388608,
+ "trusted": [],
+ "vendors": {}
+}

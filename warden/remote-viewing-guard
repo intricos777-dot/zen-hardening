@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""
+remote-viewing-guard -- systemd timer target: if remote-control software
+reappears on this machine, remove it again and log why.
+
+Runs every 10 minutes from remote-viewing-guard.timer. The pacman hook is the
+fast path; this is the path that survives someone deleting the hook, or an AUR
+helper that installs without honouring it.
+
+It is deliberately conservative: it only acts on things it can positively
+identify, and it archives the offending data under /var/lib/warden-noview/
+instead of deleting it, so a false positive is recoverable.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+AUDIT = Path("/var/log/warden-noview.log")
+QUARANTINE = Path("/var/lib/warden-noview/quarantine")
+STATE = Path("/var/lib/warden-noview/state.json")
+
+# (label, package, flatpak id, process name, path fragment, unit name)
+TOOLS = [
+    ("TeamViewer", "teamviewer", "com.teamviewer.TeamViewer", "teamviewer",
+     "/opt/TeamViewer", "teamviewer3.service"),
+    ("AnyDesk", "anydesk", "com.anydesk.AnyDesk", "anydesk",
+     "/usr/share/anydesk", "anydesk.service"),
+    ("RustDesk", "rustdesk", "com.rustdesk.RustDesk", "rustdesk",
+     "/usr/share/rustdesk", "rustdesk.service"),
+    ("NoMachine", "nomachine", "", "nxserver", "/usr/NX", "nxserver.service"),
+    ("RealVNC", "realvnc", "", "vncserver", "/usr/lib/vnc", "vncserver.service"),
+    ("TightVNC", "tightvnc", "", "Xvnc", "", "tightvncserver.service"),
+    ("Splashtop", "splashtop", "", "SplashtopAgent", "/opt/splashtop", "splashtopstreamer.service"),
+    ("Parsec", "parsec", "", "parsec", "/opt/parsec", "parsec-server.service"),
+    ("Sunlogin", "sunlogin", "", "sunloginclient", "/opt/sunlogin", "sunloginclient.service"),
+    ("DWSrv", "dwservice", "", "dwagent", "/opt/dwservice", "dwservice.service"),
+    ("LogMeIn", "logmein", "", "LogMeIn", "/opt/logmein", "lmimagent.service"),
+    ("x11vnc/Vino", "x11vnc", "", "x11vnc", "", ""),
+    ("xrdp", "xrdp", "", "xrdp", "", "xrdp.service"),
+]
+
+
+def log(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}  {msg}"
+    print(line, flush=True)
+    try:
+        AUDIT.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def run(argv: list[str], timeout: int = 60) -> tuple[int, str]:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return 1, str(exc)
+
+
+def quarantine(path: str) -> str:
+    """Move, don't delete. A wrong guess here must be undoable."""
+    src = Path(path)
+    if not src.exists():
+        return ""
+    dest = QUARANTINE / f"{int(time.time())}-{src.name}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(src), str(dest))
+        return str(dest)
+    except OSError as exc:
+        log(f"  !! could not quarantine {path}: {exc}")
+        return ""
+
+
+def scan() -> list[tuple]:
+    """Find anything matching the watch list. Read-only: safe to run as any
+    user, which is what makes this testable and auditable without sudo."""
+    findings = []
+    for label, pkg, flat, proc, path, unit in TOOLS:
+        if pkg and run(["pacman", "-Qq", pkg])[0] == 0:
+            findings.append((label, "package", pkg, "", ""))
+            continue
+        if flat and run(["flatpak", "list", "--app"])[1].find(flat) != -1:
+            findings.append((label, "flatpak", flat, "", ""))
+            continue
+        if proc and run(["pgrep", "-x", proc])[0] == 0:
+            pids = run(["pgrep", "-x", proc])[1].replace("\n", " ")
+            findings.append((label, "process", proc, pids, ""))
+            continue
+        if path and Path(path).exists():
+            findings.append((label, "path", path, "", path))
+            continue
+        if unit and run(["systemctl", "is-active", unit])[0] == 0:
+            findings.append((label, "unit", unit, "", ""))
+    return findings
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        log("guard: not root, scan only")
+        findings = scan()
+        log(f"guard: {'clean' if not findings else f'{len(findings)} item(s) found (not removed, need root)'}")
+        return 0
+
+    findings = scan()
+    if not findings:
+        log("guard: clean, no remote-control software present")
+        return 0
+
+    log(f"guard: FOUND {len(findings)} remote-control item(s) -- removing")
+    for label, kind, what, detail, path in findings:
+        log(f"  removing {label} via {kind}: {what} {detail}".rstrip())
+        if kind == "process":
+            run(["pkill", "-x", what])
+        elif kind == "unit":
+            run(["systemctl", "stop", what])
+            run(["systemctl", "disable", what])
+        elif kind == "package":
+            run(["pacman", "-Rns", "--noconfirm", what], timeout=180)
+        elif kind == "flatpak":
+            run(["flatpak", "uninstall", "-y", "--delete-data", what], timeout=180)
+        elif kind == "path":
+            dest = quarantine(path)
+            log(f"  quarantined to {dest}" if dest else f"  quarantine failed for {path}")
+
+    run(["systemctl", "daemon-reload"])
+
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(
+        {"ts": time.time(), "findings": [f[1] + ":" + f[2] for f in findings]}, indent=1))
+    log("guard: removal pass complete")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""
+warden-nft-sync -- the ONLY thing sudo runs without a password.
+
+Given to the 'livings' account as:
+    livings ALL=(root) NOPASSWD: /usr/local/sbin/warden-nft-sync
+
+That is a real privilege boundary, so this script validates everything it is
+handed and refuses anything that is not a plain address. It never reads its
+arguments from a file, never shells out, and cannot be used to run arbitrary
+code: the only reachable effects are adding or removing elements of the
+warden blacklist set.
+
+  warden-nft-sync add    10.1.2.3
+  warden-nft-sync delete 10.1.2.3
+  warden-nft-sync sync                 # reconcile set from state json
+  warden-nft-sync list                 # show the live set
+"""
+
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SET = ("inet", "warden", "blacklist")
+STATE = Path("/var/lib/warden/blacklist.json")
+ALLOWED_FAMILIES = (ipaddress.IPv4Address,)
+
+
+def die(msg: str) -> "None":
+    sys.exit(f"warden-nft-sync: {msg}")
+
+
+def nft(argv: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["nft", *argv], capture_output=True, text=True, timeout=10)
+
+
+def validate(addr: str) -> str:
+    """Only a bare, routable IPv4 address gets through. Nothing else."""
+    if len(addr) > 45 or any(c.isspace() for c in addr):
+        die(f"refusing malformed address: {addr!r}")
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        die(f"not an IP address: {addr!r}")
+    if not isinstance(ip, ALLOWED_FAMILIES):
+        die(f"only IPv4 may be blacklisted (the nft set is type ipv4_addr): {addr}")
+    if ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+        die(f"refusing to blacklist {addr}")
+    return str(ip)
+
+
+def do_element(action: str, addr: str) -> int:
+    ip = validate(addr)
+    if action == "delete":
+        r = nft(["delete", "element", *SET, "{", ip, "}"])
+        if r.returncode:
+            print(f"not in set (or nft failed): {r.stderr.strip()}")
+            return 1
+    else:
+        # timeout 0 = permanent; the daemon owns expiry and will delete it.
+        r = nft(["add", "element", *SET, "{", ip, "timeout 0s", "}"])
+        if r.returncode:
+            print(f"nft refused: {r.stderr.strip()}")
+            return 1
+    print(f"blacklist {action} {ip}")
+    return 0
+
+
+def do_sync() -> int:
+    if not STATE.exists():
+        die(f"no state file at {STATE}")
+    blob = json.loads(STATE.read_text())
+    now = time.time()
+    want = {ip: rec for ip, rec in (blob.get("blacklist") or {}).items()
+            if rec.get("until", 0) > now}
+    r = nft(["-j", "list", "set", *SET])
+    have = set()
+    if r.returncode == 0:
+        for item in json.loads(r.stdout).get("nftables", []):
+            have |= {e for e in (item.get("set", {}).get("elem") or []) if isinstance(e, str)}
+    added = sorted(set(want) - have)
+    removed = sorted(have - set(want))
+    for ip in added:
+        nft(["add", "element", *SET, "{", ip, "timeout 0s", "}"])
+    for ip in removed:
+        nft(["delete", "element", *SET, "{", ip, "}"])
+    print(f"synced: {len(added)} added, {len(removed)} removed, {len(want)} active in state")
+    return 0
+
+
+def do_list() -> int:
+    r = nft(["list", "set", *SET])
+    print(r.stdout or r.stderr or "(empty)")
+    return r.returncode
+
+
+def main() -> int:
+    # Validate and normalise arguments BEFORE demanding root, so the
+    # validation path is testable unprivileged and is the first thing that
+    # runs. Validation has no side effects; nothing privileged has happened
+    # at this point.
+    if len(sys.argv) < 2:
+        die("usage: warden-nft-sync {add|delete|sync|list} [address]")
+    action = sys.argv[1]
+    if action not in ("add", "delete", "sync", "list"):
+        die(f"unknown action: {action!r} (use add|delete|sync|list)")
+    target = None
+    if action in ("add", "delete"):
+        if len(sys.argv) != 3:
+            die(f"{action} needs exactly one address")
+        target = validate(sys.argv[2])
+
+    if os.geteuid() != 0:
+        die("arguments valid, but this must run as root")
+
+    if action == "sync":
+        return do_sync()
+    if action == "list":
+        return do_list()
+    return do_element(action, target)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
