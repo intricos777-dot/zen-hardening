@@ -18,14 +18,29 @@ DRY=0
 IFACE="${BDE_IFACE:-wlo1}"
 DB=/var/lib/arpwatch/arpwatch.dat
 LOG=/var/log/arpwatch-spoof.log
-HOOK="$HOME/Projects/zen-hardening/arpwatch-spoof-alert.sh"
 UNIT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/arpwatch-spoof.service"
 UNIT_DST=/etc/systemd/system/arpwatch-spoof.service
+
+# Resolve the REAL user's home. Under sudo, $HOME is /root, so every path into
+# the user's own ~/Projects silently becomes /root/Projects/... and the script
+# reports the hook as missing. SUDO_USER names whoever actually invoked it.
+SUDO_USER_NAME="${SUDO_USER:-}"
+if [ -n "$SUDO_USER_NAME" ]; then
+    TARGET_HOME="$(getent passwd "$SUDO_USER_NAME" | cut -d: -f6)"
+else
+    TARGET_HOME="$HOME"
+fi
+[ -n "$TARGET_HOME" ] && [ -d "$TARGET_HOME" ] || {
+    echo "ERROR: cannot resolve the invoking user's home (got '$TARGET_HOME')" >&2
+    exit 1
+}
+HOOK="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-alert.sh"
 
 run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
 
 echo "=== arpwatch spoof detection installer ==="
 echo "  interface : $IFACE"
+echo "  home      : $TARGET_HOME (from SUDO_USER=${SUDO_USER:-none})"
 echo "  database  : $DB"
 echo "  log       : $LOG"
 [ "$DRY" = 1 ] && echo "  mode      : DRY RUN"
@@ -59,8 +74,19 @@ else
 fi
 
 echo "[4/5] installing unit"
-# The unit hardcodes this user's home; regenerate it if that changed.
-run sudo install -Dm644 "$UNIT_SRC" "$UNIT_DST"
+# The unit in the repo has this user's path baked in. Rewrite the home and add an
+# explicit Environment=HOME, so the installed unit always matches the resolved
+# home rather than whatever was committed. The hook needs a correct HOME too:
+# systemd starts the service as root, and arpwatch's -u does not fix up the
+# environment, so without this the hook sees HOME=/root.
+UNIT_TMP="$(mktemp)"
+sed -e "s#/home/livings#$TARGET_HOME#g" "$UNIT_SRC" > "$UNIT_TMP"
+if ! grep -q "^Environment=HOME=" "$UNIT_TMP"; then
+    sed -i "/^\[Service\]/a Environment=HOME=$TARGET_HOME" "$UNIT_TMP"
+fi
+run sudo install -Dm644 "$UNIT_TMP" "$UNIT_DST"
+rm -f "$UNIT_TMP"
+echo "    unit paths resolved against $TARGET_HOME"
 
 echo "[5/5] enabling"
 run sudo systemctl daemon-reload

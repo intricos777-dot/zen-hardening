@@ -30,8 +30,49 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ALERT="$HOME/Projects/shield-kitty/shield-kitty-alert.py"
+
+# The alert script is a SIBLING of this script's parent directory:
+#   ~/Projects/zen-hardening/arpwatch-spoof-alert.sh   <- this file
+#   ~/Projects/shield-kitty/shield-kitty-alert.py      <- the notifier
+#
+# Deriving it from BASH_SOURCE rather than $HOME is deliberate. This hook runs
+# as a child of arpwatch, which systemd starts as root, so $HOME is /root and
+# "$HOME/Projects/shield-kitty/..." does not exist. That failure is silent --
+# the alert is simply dropped and only a line in the log says why.
+ALERT="${BDE_ALERT:-$(dirname "$HERE")/shield-kitty/shield-kitty-alert.py}"
 LOG="${BDE_ARPWATCH_LOG:-/var/log/arpwatch-spoof.log}"
+
+# Reconstruct enough of the graphical session for notify-send to work.
+#
+# arpwatch is started by systemd as root and drops to the user with -u, which
+# changes the uid but NOT the environment. The hook therefore inherits neither
+# DISPLAY, nor WAYLAND_DISPLAY, nor DBUS_SESSION_BUS_ADDRESS, and every
+# notification silently fails -- the alert is written to the log and nothing
+# appears. This is not hypothetical: it is what a bare `env -i` run reproduces.
+#
+# The user bus socket is the only thing that really matters: the notification
+# daemon is already listening there, so pointing DBUS_SESSION_BUS_ADDRESS at it
+# is enough to deliver. Verified against this machine's layout.
+bootstrap_session_env() {
+    local uid="${EUID:-$UID}" rt
+    rt="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$rt/bus" ]; then
+        export XDG_RUNTIME_DIR="$rt"
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus"
+    fi
+
+    # Pick up a Wayland socket if one exists and nothing told us otherwise.
+    if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        local w
+        for w in "$rt"/wayland-*; do
+            [ -S "$w" ] || continue
+            export WAYLAND_DISPLAY="${w##*/}"
+            break
+        done
+    fi
+}
+bootstrap_session_env
 
 # arpwatch MACs are colon-separated. Normalise to lowercase for comparison.
 norm_mac() { printf '%s' "${1,,}" | tr -d '-' ; }
@@ -73,9 +114,15 @@ PY
     [ -f "$ALERT" ] || { log "alert script missing at $ALERT"; return 0; }
     # --fullscreen is deliberately NOT used: a spoof alert must not take over
     # the screen, consistent with the notification-first policy.
-    if ! python3 "$ALERT" "$payload" 2>>"$LOG"; then
-        log "alert delivery failed (see above)"
-    fi
+    #
+    # Capture the notifier's output rather than redirecting into $LOG: if the log
+    # is not writable the redirect itself fails and the real error is lost,
+    # which is exactly when you need to read it. log() falls back to stderr.
+    local out rc=0
+    out="$(python3 "$ALERT" "$payload" 2>&1)" || rc=$?
+    [ -n "$out" ] && log "alert: $out"
+    [ "$rc" -ne 0 ] && log "alert delivery failed (rc=$rc)"
+    return 0
 }
 
 selftest() {
