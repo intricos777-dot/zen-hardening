@@ -217,9 +217,13 @@ echo "  [ok] installed $(ls -1 /usr/local/sbin/audit-* | wc -l) read-only helper
   echo "# The underlying binaries (/usr/bin/nft, /usr/bin/btrfs,"
   echo "# /usr/bin/firewall-cmd, fail2ban-client) are deliberately NOT listed:"
   echo "# they can mutate state, so unpassworded access would equal root."
-  printf '%s ALL=(root) NOPASSWD:' "$SUDO_USER_NAME"
-  for h in "${HELPERS[@]}"; do printf ' /usr/local/sbin/%s,' "$h"; done
-  printf '\n'
+  # Join with ", " and no trailing separator: sudoers rejects a trailing
+  # comma (syntax error at the column just past the end of the line).
+  entries=""
+  for h in "${HELPERS[@]}"; do
+    entries+="${entries:+, }/usr/local/sbin/$h"
+  done
+  printf '%s ALL=(root) NOPASSWD: %s\n' "$SUDO_USER_NAME" "$entries"
 } > "$SUDOERS_FILE"
 
 chmod 0440 "$SUDOERS_FILE"

@@ -110,20 +110,43 @@ if [ -f "$HERE/shield-kitty-fail2ban.local" ]; then
   run install -m 0644 -o root -g root "$HERE/shield-kitty-fail2ban.local" \
       /etc/fail2ban/jail.d/shield-kitty.conf
   ok "shield-kitty.conf installed"
-  # The file ships recidive DISABLED so a first-ever install cannot abort
-  # (recidive reads /var/log/fail2ban.log, which does not exist until fail2ban
-  # has run once, and a missing log aborts ALL jails). Enable it only when the
-  # log is present.
-  if [ -f /var/log/fail2ban.log ]; then
-    if [ "$CHECK_ONLY" -eq 0 ]; then
-      sed -i 's/^enabled  = false/enabled  = true/' /etc/fail2ban/jail.d/shield-kitty.conf
-      ok "/var/log/fail2ban.log exists -> recidive enabled"
-    else
-      note "would enable recidive (/var/log/fail2ban.log exists)"
-    fi
+
+  # Set recidive's enabled flag to match reality, in BOTH directions.
+  #
+  # recidive reads /var/log/fail2ban.log. On a first-ever install that file
+  # does not exist, and a jail pointing at a missing log aborts the whole
+  # fail2ban startup -- every jail, not just recidive. So the flag must be
+  # false until the log exists, and true once it does.
+  #
+  # The source file may ship with either value (it currently ships true,
+  # matching this machine), so this cannot be a one-way "false -> true" sed.
+  # It also MUST be scoped to the [recidive] section: 'enabled = true'
+  # appears under [sshd] as well, and a blanket substitution would silently
+  # disable the sshd jail too.
+  if [ -f /var/log/fail2ban.log ]; then RECIDIVE_WANT=true; else RECIDIVE_WANT=false; fi
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    note "would set [recidive] enabled = ${RECIDIVE_WANT}"
+    note "  (log present: $([ -f /var/log/fail2ban.log ] && echo yes || echo no))"
   else
-    note "no /var/log/fail2ban.log yet — recidive left disabled (correct for"
-    note "a first run). Re-run this script after fail2ban has started once."
+    CONF=/etc/fail2ban/jail.d/shield-kitty.conf
+    RECIDIVE_HAD=$(awk '/^\[recidive\]/{r=1;next} /^\[/{r=0} r&&/^[[:space:]]*enabled[[:space:]]*=/{print $3;exit}' "$CONF")
+    awk -v want="$RECIDIVE_WANT" '
+      /^\[recidive\]/          { inrec = 1 }
+      /^\[/ && !/^\[recidive\]/ { inrec = 0 }
+      inrec && /^[[:space:]]*enabled[[:space:]]*=/ { print "enabled  = " want; next }
+      { print }
+    ' "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
+
+    if [ "$RECIDIVE_WANT" = "true" ]; then
+      ok "[recidive] enabled (log exists)"
+    else
+      ok "[recidive] left disabled — no /var/log/fail2ban.log yet"
+      note "re-run this script after fail2ban has started once and the"
+      note "recidive jail will be enabled automatically."
+    fi
+    [ "$RECIDIVE_HAD" != "$RECIDIVE_WANT" ] && \
+      note "[recidive] enabled: ${RECIDIVE_HAD} -> ${RECIDIVE_WANT}"
   fi
   if [ "$CHECK_ONLY" -eq 0 ]; then
     if fail2ban-client -t >/dev/null 2>&1; then

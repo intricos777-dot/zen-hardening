@@ -37,9 +37,19 @@ HOOK="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-alert.sh"
 SCAN="$TARGET_HOME/Projects/zen-hardening/arpwatch-spoof-scan.sh"
 UNIT_DST_DIR=/etc/systemd/system
 
-# Kept in one place and shared with the unit via the parse-check below, so the
+# Keep in one place and shared with the unit via the parse-check below, so the
 # two cannot drift. -q is deliberately absent: see arpwatch-spoof.service.
 ARPWATCH_ARGS="-F -i $IFACE -f $DB -s -N -z"
+
+# The parse probe must not touch the real datafile, and it must be bounded.
+#
+# A plain "arpwatch <args>" probe is not safe here. Unprivileged it exits
+# immediately on the raw socket, but the installer runs as root, where -F keeps
+# it in the foreground with a working socket and it never returns -- the
+# install hung on a perfectly healthy arpwatch. timeout 3 caps it, and exit 124
+# then means "still running", i.e. the flags were accepted.
+ARPWATCH_PROBE_DB="$(mktemp -u)/probe.dat"
+mkdir -p "$(dirname "$ARPWATCH_PROBE_DB")"
 
 run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
 
@@ -75,15 +85,24 @@ fi
 # and costs nothing. Getting this wrong produced a service stuck in a restart
 # loop, twice, because the failure only shows up in the journal.
 if command -v arpwatch >/dev/null 2>&1; then
-    if arpwatch $ARPWATCH_ARGS >/dev/null 2>&1 || \
-       ! arpwatch $ARPWATCH_ARGS 2>&1 | head -3 | grep -q usage; then
-        echo "    flags parse OK: arpwatch $ARPWATCH_ARGS"
+    probe_out=""
+    if probe_out="$(timeout 3 arpwatch -F -i "$IFACE" -f "$ARPWATCH_PROBE_DB" -s -N -z 2>&1)"; then
+        probe_rc=0
     else
+        probe_rc=$?
+    fi
+    if printf '%s' "$probe_out" | grep -q usage; then
         echo "    ERROR: arpwatch rejects these flags: $ARPWATCH_ARGS" >&2
         echo "           it printed its usage message. Check the man page" >&2
         echo "           against the binary -- they disagree about -q." >&2
         exit 1
     fi
+    if [ "$probe_rc" = 124 ]; then
+        echo "    flags parse OK: arpwatch $ARPWATCH_ARGS (still running when the probe timed out)"
+    else
+        echo "    flags parse OK: arpwatch $ARPWATCH_ARGS (probe exited $probe_rc, unprivileged socket denial)"
+    fi
+    rm -rf "$(dirname "$ARPWATCH_PROBE_DB")"
 fi
 
 echo "[3/6] preparing state"
