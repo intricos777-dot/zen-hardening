@@ -62,18 +62,18 @@ sshd is ever enabled — it is not evidence of current protection.
 If you enable sshd, the jail will start working immediately with no config
 change.
 
-## The permanent-ban trap
+## The self-ban trap
 
-All jails use `bantime = -1` — permanent, never expiring. `ignoreip` covers
-loopback and RFC1918, so on your current network (10.245.106.176) you cannot be
-banned.
+All jails use `bantime = 86400` — 24 hours, then they expire on their own.
+`ignoreip` covers loopback and RFC1918, so on your current network
+(10.197.250.246) you cannot be banned.
 
 **The moment you connect from a public address — tethering, cafe wifi, airport
 — you are no longer in `ignoreip`, and four wrong sudo passwords would ban your
-own address on every port, permanently.**
+own address on every port for a day.** `unban-self.sh` is the escape hatch.
 
 This is why the `sudo`/`sddm` jails being dead is, right now, the reason you
-have not locked yourself out.
+have not locked yourself out — the ban expires by itself after 24h.
 
 Escape hatch:
 

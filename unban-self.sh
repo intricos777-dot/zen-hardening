@@ -3,12 +3,12 @@
 #
 # WHY THIS EXISTS
 #
-# The fail2ban policy uses bantime = -1 (permanent) on sddm, sudo and sshd.
+# The fail2ban policy uses bantime = 86400 (24 hours) on sshd and recidive.
 # ignoreip covers loopback and RFC1918, so on your home wifi you cannot ban
 # yourself. But the moment you connect over a PUBLIC address — tethering, a
 # cafe, an airport — your address is no longer in ignoreip, and four
-# fat-fingered sudo passwords permanently bans you from your own machine, on
-# every port, with no expiry.
+# fat-fingered sudo passwords bans you from your own machine for a day, on
+# every port.
 #
 # This script is the escape hatch. It reads your CURRENT addresses and clears
 # bans against exactly those, so you can always get back in from the console
