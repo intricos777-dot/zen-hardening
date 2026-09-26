@@ -5,7 +5,23 @@ After=arpwatch-spoof.service
 
 [Service]
 Type=oneshot
+
+# Run as the desktop user, NOT root.
+#
+# With no User= this unit inherited root, and the scanner's session bootstrap
+# then resolved XDG_RUNTIME_DIR to /run/user/0 -- a bus that does not exist --
+# so notifications would fail silently while the scan itself looked healthy.
+# Running as the user whose Shield Kitty is actually on the bus is the point.
+User=livings
+Group=livings
+
+# Be explicit instead of trusting the bootstrap: a system unit gets none of
+# these. /run/user/1000 is correct whenever the user is logged in, and the
+# bootstrap is retained only as a fallback for odd environments.
 Environment=HOME=/home/livings
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
 ExecStart=/home/livings/Projects/zen-hardening/arpwatch-spoof-scan.sh
 NoNewPrivileges=true
 PrivateTmp=true
@@ -14,4 +30,5 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 ProtectSystem=full
 ProtectHome=read-only
+# The scanner only needs to read arp.dat and rewrite its own dedup state.
 ReadWritePaths=/var/lib/arpwatch /var/log

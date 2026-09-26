@@ -106,12 +106,26 @@ if command -v arpwatch >/dev/null 2>&1; then
 fi
 
 echo "[3/6] preparing state"
-# Owned by livings, not root: arpwatch drops to livings via -u before it writes
-# either of these, and the exec hook runs as livings so notify-send can reach
-# the session bus. Root-owned files here would break the service.
-run sudo install -d -m 0750 -o root -g root /var/lib/arpwatch
-# arpwatch(8): "an empty arp.dat file must be created before the first run".
-run sudo install -m 0644 -o root -g root /dev/null /var/lib/arpwatch/arp.dat
+# 0755 so the unprivileged scanner (User=livings) can traverse into the
+# directory. It was 0750 root:root, which locks livings out of the dir entirely
+# even though the datafile inside is world-readable.
+run sudo install -d -m 0755 -o root -g root /var/lib/arpwatch
+
+# arpwatch(8) wants an empty arp.dat before the first run -- but ONLY create it
+# when absent. Truncating it here destroyed every address already collected,
+# and on a re-run it was truncating a file the running service was appending to.
+if [ -f "$DB" ]; then
+    echo "    existing $DB preserved ($(wc -l <"$DB" 2>/dev/null || echo '?' entries)"
+else
+    run sudo install -m 0644 -o root -g root /dev/null "$DB"
+    echo "    created empty $DB"
+fi
+
+# The scanner rewrites this file on every run, so it must belong to the user the
+# scanner runs as. A root-owned state file makes dedup fail with a permission
+# error that the script only logs, and then it re-alerts on every single scan.
+run sudo install -m 0644 -o livings -g livings /dev/null /var/lib/arpwatch/spoof-state
+
 if [ -f "$LOG" ]; then
     echo "    existing $LOG preserved"
 else

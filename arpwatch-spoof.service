@@ -26,6 +26,12 @@ ExecStart=/usr/sbin/arpwatch -F -i wlo1 -f /var/lib/arpwatch/arp.dat -s -N -z
 Restart=on-failure
 RestartSec=30
 
+# arpwatch chdir()s to its arpdir (/usr/arpwatch) at startup, which does not
+# exist here, logs "chdir(...): No such file or directory" and falls back to the
+# working directory. For a system unit that is /. Point it at the real state
+# directory so the fallback is harmless and the warning stops.
+WorkingDirectory=/var/lib/arpwatch
+
 # Needs the raw socket only. Runs as root because pcap_bind needs it; the
 # datafile is what the unprivileged scanner reads.
 NoNewPrivileges=true
