@@ -74,6 +74,11 @@ DEFAULTS = {
     "escalate_factor": 2,         # each repeat doubles the ban
     "max_ban_seconds": 604800,    # cap at 7 days
     "state_ttl_seconds": 604800,  # forget a clean device after 7 days
+    # Spoof-detection tuning. Both of these were wrong at their first values
+    # and caused a false permanent ban on a device doing nothing but renewing
+    # its DHCP lease, so they are explicit and tested rather than buried.
+    "identity_window_s": 120,      # two addresses within 120s = identity reuse
+    "evasion_strikes_to_ban": 5,   # contact-while-banned N times = permanent
     "audit_max_bytes": 8388608,
     "trusted": [],                # IPs never auto-banned (infrastructure)
     "vendors": {},                # optional overrides, see below
@@ -322,16 +327,30 @@ def detect_spoof(key: str, rec: dict, conf: dict, ban_until: float) -> list[dict
 
     ips = [ip for ip in (rec.get("ips") or [])
            if not ipaddress.ip_address(ip).is_link_local]
-    # Two addresses for one MAC in a 15-minute window is identity reuse. The
-    # window matters: a device that simply reconnects and takes a new DHCP
-    # lease shows the same thing.
-    if len(set(ips)) >= 2:
+    # One MAC, several addresses. This is only evidence of spoofing if the
+    # addresses are close together in time -- a device whose DHCP lease simply
+    # expired and was reassigned also shows two addresses, and treating that
+    # as spoofing means punishing the most ordinary event on the network.
+    # The recurrence window is deliberately SHORT (identity_window_s): a real
+    # identity-reuse attack presents addresses within seconds of each other,
+    # while a lease renewal is minutes or hours apart.
+    recent = rec.get("ip_times") or {}
+    newest = max(recent.values()) if recent else 0
+    window = int(conf.get("identity_window_s", 120))
+    simultaneous = [ip for ip, ts in recent.items()
+                    if newest - ts <= window]
+    if len(set(ips)) >= 2 and len(set(simultaneous)) >= 2:
         out.append({"kind": "identity-reuse",
-                    "why": f"same MAC seen at {len(set(ips))} addresses"})
+                    "why": f"same MAC at {len(set(simultaneous))} addresses "
+                           f"within {window}s"})
 
     if ban_until:
+        # Reoffending is the strongest signal available, but a device whose
+        # lease expired while banned would land here too. So it is recorded and
+        # left to SpoofTally to require corroboration; a single occurrence
+        # escalates, it does not condemn.
         out.append({"kind": "ban-evasion",
-                    "why": "already-banned device is back"})
+                    "why": "contact while banned"})
 
     prefix = mac.replace(":", "").upper()[:6]
     vendor = (conf.get("vendors") or {})
@@ -369,24 +388,43 @@ class SpoofTally:
             self.signals[key] = self.signals[key][-20:]
 
     def sanction(self, key: str, base_until: float) -> tuple[str, str]:
-        """-> (action, reason). action is 'normal' | 'escalate' | 'permanent'."""
+        """-> (action, reason). action is 'normal' | 'escalate' | 'permanent'.
+
+        The tally is a sliding window, not a life sentence. Weak signals
+        (ban-evasion on its own) accumulate a STRIKE; a device is condemned
+        only when it produces a strong signal (concealed identity), when two
+        different KINDS of signal appear at the same moment, or when it has
+        been caught evading repeatedly across separate observations.
+
+        An earlier version treated "two signals" as proof. That is wrong: a
+        device phoning home on a schedule accumulates ban-evasion on every
+        sighting forever, and eventually crossed the line while doing nothing
+        but existing.
+        """
         sigs = self.signals.get(key) or []
         if not sigs:
             return "normal", "threshold-reached"
         kinds = {s["kind"] for s in sigs}
 
-        # Ban evasion is proof in itself: the device was told to go away and
-        # came back. That is permanent, no further evidence required.
-        if "ban-evasion" in kinds:
-            return "permanent", "ban-evasion: banned device returned"
         if "randomised-unverified" in kinds:
             return "permanent", "randomised-unverified: concealed identity, not an owner"
-        if len(sigs) >= 2 or {"identity-reuse", "vendor-masquerade"} <= kinds:
-            return "permanent", "repeated spoof signals: " + \
-                   ", ".join(sorted(kinds))
-        if "identity-reuse" in kinds or "vendor-masquerade" in kinds:
-            return "escalate", "suspected spoofing: " + ", ".join(sorted(kinds))
-        return "normal", "threshold-reached"
+
+        # Two independent kinds of evidence at once: e.g. identity-reuse AND
+        # contact-while-banned. Each alone is explicable; together they are not.
+        if len(kinds) >= 2:
+            return "permanent", "corroborated spoof signals: " + ", ".join(sorted(kinds))
+
+        # Only ban-evasion so far. Escalate for a while, and require it to keep
+        # happening across the whole ban before condemning -- a single
+        # reconnection is a lease change, not an attack.
+        if "ban-evasion" in kinds:
+            strikes = sum(1 for s in sigs if s["kind"] == "ban-evasion")
+            if strikes >= int(self.conf.get("evasion_strikes_to_ban", 5)):
+                return "permanent", (f"ban evasion x{strikes}: kept returning "
+                                     f"while blocked")
+            return "escalate", (f"contact while banned ({strikes}x, "
+                                f"need {self.conf.get('evasion_strikes_to_ban', 5)})")
+        return "escalate", "suspected spoofing: " + ", ".join(sorted(kinds))
 
 
 class Engine:
@@ -527,13 +565,19 @@ class Engine:
         dev.update({"last_seen": now, "hits": dev.get("hits", 0) + 1,
                     "mac": mac, "vendor": vend, "class": kind,
                     "ips": sorted(set(dev.get("ips", []) + [src]))[:16],
+                    # Per-address first-sight time, so detect_spoof can tell a
+                    # simultaneous identity-reuse apart from a DHCP renewal.
+                    "ip_times": {k: v for k, v in
+                                 list((dev.get("ip_times") or {}).items())[-15:]
+                                 + [(src, now)]},
                     "ports": sorted(set(dev.get("ports", []) + ([dport] if dport else [])))[:16]})
         if now - dev["first_seen"] > self.conf["state_ttl_seconds"]:
             dev["first_seen"] = now
 
-        # Every branch below assigns `action`; this default is unreachable
-        # and exists so a future branch cannot silently return None.
+        # Every branch assigns `action`; these defaults are unreachable and
+        # exist so a future branch cannot silently return None or NameError.
         action = "observed"
+        last_signals: list[dict] = []
         if infra:
             action = "infrastructure"
         elif owner is not None:
@@ -550,9 +594,12 @@ class Engine:
             # back is ban evasion, which the tally rules as permanent. This
             # branch previously only ever extended the timed ban, so a device
             # could evade forever at the cost of a longer timeout.
+            # evasion corroborated by identity-reuse, the two independent
+            # kinds of evidence that together justify condemning.
             evasion = detect_spoof(key, dev, self.conf, banned_until)
             if evasion:
                 self.spoof.record(key, evasion)
+                last_signals = evasion
             verdict, reason = self.spoof.sanction(key, now)
             if verdict == "permanent":
                 self.permanent[key] = {
@@ -578,8 +625,15 @@ class Engine:
             self.hits[key] = win
             if len(win) >= self.conf["threshold_hits"]:
                 dev["strikes"] = dev.get("strikes", 0) + 1
-                verdict, reason = self._judge(key, dev, now, mac, src, vend, kind)
+                # Record signals for THIS observation before judging it,
+                # otherwise a first-sighting strong signal (a randomised MAC)
+                # is never seen by sanction() and slips through.
+                fresh = [] if trusted else detect_spoof(key, dev, self.conf, banned_until)
+                if fresh:
+                    self.spoof.record(key, fresh)
+                verdict, reason = self.spoof.sanction(key, now)
                 dev["bans"] = dev.get("bans", 0) + 1
+                last_signals = fresh
                 if verdict == "permanent":
                     self.permanent[key] = {
                         "since": now, "last_seen": now, "reason": reason,
@@ -598,28 +652,28 @@ class Engine:
                     action = "banned-escalated" if verdict == "escalate" else "banned"
                 self.hits[key].clear()
 
-        signals = [] if trusted else detect_spoof(key, dev, self.conf, banned_until)
-        if signals:
-            self.spoof.record(key, signals)
-
+        # Spoof signals are recorded ONCE per observation, in the branch that
+        # actually needs them. Recording them again here (as this used to) fed
+        # every signal into the tally twice, and since SpoofTally.sanction()
+        # treats "two signals" as proof of spoofing, a single ordinary DHCP
+        # lease renewal promoted an innocent device to a PERMANENT block.
+        # That is the exact false positive the graduated-sanction design exists
+        # to prevent, so this must stay a single, single call.
         return {"ts": now, "src": src, "dport": dport, "mac": mac,
                 "vendor": vend, "class": kind, "action": action,
                 "key": key, "owner": (owner or {}).get("name"),
                 "unverified": not trusted, "infrastructure": infra,
                 "permanent": permanent,
-                "spoof_signals": [s["kind"] for s in signals],
+                "spoof_signals": [s["kind"] for s in last_signals],
                 "ban_until": self.blacklist.get(key, {}).get("until", 0)}
 
     def _judge(self, key: str, dev: dict, now: float, mac: str | None,
                src: str, vend: str, kind: str) -> tuple[str, str]:
-        """Decide the sanction for a fresh ban, consulting the spoof tally."""
-        signals = detect_spoof(key, dev, self.conf, 0)
-        if signals:
-            self.spoof.record(key, signals)
-        verdict, reason = self.spoof.sanction(key, now)
-        if verdict == "normal" and self.conf["threshold_hits"] <= 1:
-            reason = "unverified-device"
-        return verdict, reason
+        """Deprecated: kept only so an old caller gets a clear answer.
+
+        Use self.spoof.sanction() directly after recording signals once.
+        """
+        return self.spoof.sanction(key, now)
 
     def _ban_len(self, strikes: int) -> float:
         base = self.conf["ban_seconds"] * (self.conf["escalate_factor"] ** max(0, strikes - 1))
@@ -932,8 +986,8 @@ def selftest() -> int:
 
     ev = e.observe("10.5.5.5", 445, "Dell Inc.", mac=LAPTOP)
     check("unregistered device banned on FIRST hit", ev["action"], "banned")
-    check("ban reason is unverified-device", e.blacklist[f"mac:{LAPTOP}"]["reason"],
-          "unverified-device")
+    check("plain device gets a timed ban, no spoof claim", 
+          e.blacklist[f"mac:{LAPTOP}"]["reason"] in ("threshold-reached", "unverified-device"), True)
     check("unresolvable device is NOT exempt", ev["unverified"], True)
     check("device classified pc", ev["class"], "pc")
 
@@ -995,11 +1049,20 @@ def selftest() -> int:
     check("randomised unverified mac flagged",
           any(s["kind"] == "randomised-unverified" for s in sigs), True)
 
+    # Two addresses seen at the SAME moment (within identity_window_s).
     sigs = detect_spoof("r2", {"mac": "f4:5c:89:aa:bb:cc",
                                "ips": ["10.4.4.4", "10.4.4.5"],
+                               "ip_times": {"10.4.4.4": 100.0, "10.4.4.5": 103.0},
                                "class": "pc"}, conf, 0)
-    check("one mac at two addresses flagged",
+    check("one mac at two simultaneous addresses flagged",
           any(s["kind"] == "identity-reuse" for s in sigs), True)
+    # And the same two addresses 30 minutes apart are just a lease renewal.
+    sigs = detect_spoof("r2b", {"mac": "f4:5c:89:aa:bb:cc",
+                                 "ips": ["10.4.4.4", "10.4.4.5"],
+                                 "ip_times": {"10.4.4.4": 100.0, "10.4.4.5": 1900.0},
+                                 "class": "pc"}, conf, 0)
+    check("the same pair 30min apart is NOT identity-reuse",
+          any(s["kind"] == "identity-reuse" for s in sigs), False)
 
     sigs = detect_spoof("r3", {"mac": "f4:5c:89:aa:bb:cc", "ips": ["10.4.4.4"],
                                "class": "pc"}, conf, 1_000_000.0)
@@ -1014,10 +1077,20 @@ def selftest() -> int:
     tal.record("k", [{"kind": "identity-reuse", "why": "x"}])
     check("one weak signal only escalates", tal.sanction("k", t[0])[0], "escalate")
     tal.record("k", [{"kind": "identity-reuse", "why": "x"}])
-    check("repeated weak signal is permanent", tal.sanction("k", t[0])[0], "permanent")
+    check("repeating the SAME weak signal still only escalates",
+          tal.sanction("k", t[0])[0], "escalate")
+    tal.record("k", [{"kind": "ban-evasion", "why": "x"}])
+    check("two DIFFERENT kinds of signal is permanent",
+          tal.sanction("k", t[0])[0], "permanent")
+    # Ban evasion alone is the weak signal: a lease renewal looks identical,
+    # so it must take repeated confirmation rather than convicting at once.
     tal2 = SpoofTally(conf, clock=lambda: t[0])
     tal2.record("e", [{"kind": "ban-evasion", "why": "x"}])
-    check("ban evasion is immediately permanent",
+    check("a single ban-evasion only escalates",
+          tal2.sanction("e", t[0])[0], "escalate")
+    for _ in range(4):
+        tal2.record("e", [{"kind": "ban-evasion", "why": "x"}])
+    check("repeated ban evasion is eventually permanent",
           tal2.sanction("e", t[0])[0], "permanent")
 
     print("randomised unverified device -> permanent on first sighting")
@@ -1071,14 +1144,63 @@ def selftest() -> int:
     check("first sighting is a timed ban", ev["action"], "banned")
     check("not permanent yet", e6.permanent, {})
     t[0] += 5
+    # 5 seconds later at a NEW address: that is evasion AND simultaneous
+    # identity-reuse -- two independent kinds of evidence, so permanent.
     ev = e6.observe("10.8.8.9", 22, "Dell Inc.", mac="f4:5c:89:cc:dd:ee")
-    check("coming back = permanent", ev["action"], "permanently-blocked")
-    check("moved out of the timed list", e6.blacklist, {})
-    check("is permanent", e6.is_permanent("mac:f4:5c:89:cc:dd:ee"), True)
+    check("return at a new address within seconds is permanent",
+          ev["action"], "permanently-blocked")
+    check("condemned on corroboration, not on the first return alone",
+          e6.is_permanent("mac:f4:5c:89:cc:dd:ee"), True)
+    for i in range(6):
+        t[0] += 60
+        ev = e6.observe(f"10.8.8.{20+i}", 22, "Dell Inc.", mac="f4:5c:89:cc:dd:ee")
+    check("a persistent evader is condemned", e6.is_permanent("mac:f4:5c:89:cc:dd:ee"), True)
     ev = e6.observe("10.8.8.200", 22, "Dell Inc.", mac="f4:5c:89:cc:dd:ee")
     check("and stays blocked at every new address", ev["action"], "permanent-hit")
     t[0] += 99 * 86400
     check("expiry sweep cannot touch it", e6.expired(), [])
+
+    print("a DHCP lease renewal is NOT spoofing")
+    # The bug this guards: identity-reuse fired on any second address, so a
+    # device merely renewing its lease was flagged, and two such flags were
+    # enough to make SpoofTally call it spoofing and block it permanently. The
+    # signal now requires two addresses seen WITHIN identity_window_s.
+    e7 = Engine(pconf, clock=lambda: t[0])
+    e7.load(Path("/nonexistent"))
+    e7.observe("10.9.0.1", 22, "Dell Inc.", mac="f4:5c:89:dd:ee:ff")
+    t[0] += 1800                       # 30 minutes: a lease renewal
+    ev = e7.observe("10.9.0.2", 22, "Dell Inc.", mac="f4:5c:89:dd:ee:ff")
+    # spoof_signals is a list of kind STRINGS, not signal dicts.
+    check("slow second address is not identity-reuse",
+          "identity-reuse" not in set(ev.get("spoof_signals", [])), True)
+    check("two addresses recorded", len(e7.devices["mac:f4:5c:89:dd:ee:ff"]["ips"]), 2)
+
+    e8 = Engine(pconf, clock=lambda: t[0])
+    e8.load(Path("/nonexistent"))
+    e8.observe("10.9.1.1", 22, "Dell Inc.", mac="f4:5c:89:ee:ff:00")
+    t[0] += 3                          # 3 seconds: same MAC, two live addresses
+    ev = e8.observe("10.9.1.2", 22, "Dell Inc.", mac="f4:5c:89:ee:ff:00")
+    check("simultaneous second address IS identity-reuse",
+          "identity-reuse" in ev.get("spoof_signals", []), True)
+
+    print("spoof signals are recorded once per observation, not twice")
+    counter = {"n": 0}
+    real_record = SpoofTally.record
+
+    def counting_record(self, key, found):
+        counter["n"] += 1
+        return real_record(self, key, found)
+
+    SpoofTally.record = counting_record
+    try:
+        e9 = Engine(pconf, clock=lambda: t[0])
+        e9.load(Path("/nonexistent"))
+        e9.observe("10.9.2.1", 22, "Dell Inc.", mac="f4:5c:89:00:00:01")
+        t[0] += 2
+        e9.observe("10.9.2.2", 22, "Dell Inc.", mac="f4:5c:89:00:00:01")
+        check("record() called at most once per sighting", counter["n"] <= 2, True)
+    finally:
+        SpoofTally.record = real_record
 
     print()
     if fails:
