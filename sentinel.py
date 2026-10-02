@@ -32,6 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +48,33 @@ SEV_ORDER = {"ok": 0, "unverified": 1, "warn": 2, "critical": 3}
 # critical control nobody can read is an UNVERIFIED control, not a passing
 # one. They are surfaced distinctly and excluded from the intact count.
 ROOT_ONLY = {"shadow-root-locked", "no-world-writable-etc", "sudo-requires-password"}
+
+# A baseline records what was true when it was captured. Most anchors assert a
+# property whose single recorded observation *is* the invariant, but some hold
+# in more than one way, and comparing raw strings would then report a security
+# regression that never happened.
+#
+# The collector is the case that bit us: it is stopped cleanly at every
+# shutdown and takes a second or two to bind 4124 after login, because it
+# starts through npm/tsx. Watchman's first check of a session lands inside that
+# window and reads "not-listening". Scored against a "localhost-only"
+# baseline that is a *critical* drift, so every boot produced a CRITICAL alert
+# naming a service that was about to come up fine. Nine of them in five days.
+#
+# But "not-listening" is the absence of exposure, not exposure: with no
+# listener there is nothing for a remote host to reach, so the loopback-only
+# property holds a fortiori. Being down is availability, which collector-healthy
+# already reports, and already reports correctly at warn. Only a genuinely
+# non-loopback bind is a security regression and must stay critical.
+#
+# Each entry is (values that also satisfy the anchor, why that is true).
+EQUIVALENT = {
+    "collector-localhost-only": (
+        {"not-listening"},
+        "no listener means nothing is reachable off-box; availability is "
+        "tracked separately, at warn, by collector-healthy",
+    ),
+}
 
 
 # ------------------------------------------------------------------ helpers
@@ -233,6 +261,32 @@ def a_rootfs_headroom() -> str:
         return "unknown"
 
 
+def a_self_healer_alive() -> str:
+    """The self-healing watchdog layer must actually be running.
+
+    This existed for a week while every unit in it was enabled-but-inactive:
+    they were symlinked into multi-user.target.wants, a system target that does
+    not exist in the user manager, so is-enabled said "enabled" while nothing
+    ever started them. Silent, and invisible to a monitor that only watches
+    security posture.
+    """
+    rc, out = _run(["systemctl", "--user", "is-active", "bhm-self-watchdog.service"])
+    return out.strip() or "unknown"
+
+
+def a_healer_state_writable() -> str:
+    """The healer must be able to write its own log, or it fails silently."""
+    d = Path.home() / ".local/state/kernel-healer"
+    probe = d / ".write-probe"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok")
+        probe.unlink()
+        return "writable"
+    except Exception as exc:
+        return f"unwritable:{type(exc).__name__}"
+
+
 ANCHORS = [
     ("fail2ban-active", a_fail2ban_active, "warn",
      "fail2ban is the brute-force brake. Inactive means no jail is banning."),
@@ -267,6 +321,12 @@ ANCHORS = [
      "Forensic chain tamper tripwire. CHAIN-BROKEN means the evidence was edited."),
     ("rootfs-headroom", a_rootfs_headroom, "warn",
      "A full root breaks logging, journals and every service that writes to /var."),
+    ("self-healer-alive", a_self_healer_alive, "warn",
+     "The self-healing watchdog layer not running means nothing notices when "
+     "it rots — which is exactly how it sat enabled-but-inactive for a week."),
+    ("healer-state-writable", a_healer_state_writable, "warn",
+     "The kernel healer writes to ~/.local/state/kernel-healer. If that is not "
+     "writable it fails on every run and looks like a clean pass."),
 ]
 
 
@@ -297,6 +357,30 @@ def cmd_baseline(args) -> int:
     return 0
 
 
+def classify(name: str, expected, actual, sev: str) -> tuple[str, str, bool]:
+    """Decide one anchor's status. Pure, so it can be tested without a live system.
+
+    Returns (status, detail, is_drift).
+    """
+    if expected == actual:
+        if name in ROOT_ONLY and str(actual).startswith(("unreadable", "unknown", "error")):
+            # Matches its own unreadable baseline, but proves nothing.
+            return ("unverified",
+                    "needs root to evaluate — run as root or with "
+                    "CAP_SYS_ADMIN; currently unverifiable", False)
+        return "ok", "matches baseline", False
+
+    if actual in EQUIVALENT.get(name, ({}, ""))[0]:
+        # Differs from the recorded observation, but the invariant this anchor
+        # exists to assert still holds. Report it intact and say why, rather
+        # than inventing a drift that did not happen.
+        return ("ok",
+                f"invariant holds: {actual!r} satisfies {name} just as the "
+                f"recorded {expected!r} does — {EQUIVALENT[name][1]}", False)
+
+    return sev, f"expected {expected!r}, found {actual!r}", True
+
+
 def cmd_check(args) -> int:
     if not BASELINE_FILE.exists():
         print("no baseline yet — run: sentinel.py baseline", file=sys.stderr)
@@ -308,18 +392,10 @@ def cmd_check(args) -> int:
     for name, _fn, sev, desc in ANCHORS:
         expected = base.get(name)
         actual = cur.get(name)
-        if expected == actual:
-            if name in ROOT_ONLY and str(actual).startswith(("unreadable", "unknown", "error")):
-                # Matches its own unreadable baseline, but proves nothing.
-                status = "unverified"
-                why = ("needs root to evaluate — run as root or with "
-                       "CAP_SYS_ADMIN; currently unverifiable")
-                unver += 1
-            else:
-                status, why = "ok", "matches baseline"
-        else:
-            status = sev
-            why = f"expected {expected!r}, found {actual!r}"
+        status, why, is_drift = classify(name, expected, actual, sev)
+        if status == "unverified":
+            unver += 1
+        if is_drift:
             drift += 1
         results.append({"anchor": name, "status": status, "expected": expected,
                         "actual": actual, "detail": why, "severity_if_drifted": sev})
@@ -377,10 +453,25 @@ def cmd_list(args) -> int:
 
 
 def cmd_selftest(args) -> int:
-    """Verify the checker detects a planted drift, rather than always passing."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    backup = BASELINE_FILE.read_text() if BASELINE_FILE.exists() else None
+    """Verify the checker detects a planted drift, rather than always passing.
+
+    Runs entirely inside a throwaway state dir. STATE_DIR is what feeds the
+    SENTINEL_STATE env var, so redirecting it here also redirects the check
+    subprocesses spawned below. The test used to back up only baseline.json
+    while those subprocesses went on to append their planted drift=16 rows to
+    the real history.jsonl and overwrite the real last-result.json — a
+    self-test corrupting the audit trail it exists to protect. Ten such rows
+    had already accumulated.
+    """
+    global STATE_DIR, BASELINE_FILE, RESULT_FILE, HISTORY_FILE
+    real_state = (STATE_DIR, BASELINE_FILE, RESULT_FILE, HISTORY_FILE)
+    tmp = tempfile.mkdtemp(prefix="sentinel-selftest.")
     try:
+        STATE_DIR = Path(tmp)
+        BASELINE_FILE = STATE_DIR / "baseline.json"
+        RESULT_FILE = STATE_DIR / "last-result.json"
+        HISTORY_FILE = STATE_DIR / "history.jsonl"
+        os.environ["SENTINEL_STATE"] = str(STATE_DIR)
         BASELINE_FILE.write_text(json.dumps({
             "captured_at": "test", "host": "t", "user": "t",
             "values": {n: "PLANTED" for n, _f, _s, _d in ANCHORS},
@@ -408,12 +499,36 @@ def cmd_selftest(args) -> int:
                     print(f"   {r['anchor']}: {r['detail']}")
             return 1
         print("ok: identical baseline reports 0 drift (no false positives)")
+
+        # A stopped collector must NOT read as a security regression, and a
+        # genuinely exposed one still must. Pin both halves: an invariant that
+        # is merely too permissive is as broken as one that is too strict.
+        # Driven through classify() directly so the result does not depend on
+        # whether the collector happens to be running while the test executes.
+        name = "collector-localhost-only"
+        for actual, want, label in (
+            ("localhost-only", "ok", "the normal bound state is ok"),
+            ("not-listening", "ok", "a stopped collector is not exposure drift"),
+            ("EXPOSED:0.0.0.0", "critical", "a non-loopback bind is still critical"),
+            ("EXPOSED:[::]:4124", "critical", "a wildcard bind is still critical"),
+        ):
+            status, _why, is_drift = classify(name, "localhost-only", actual, "critical")
+            if status != want:
+                print(f"FAIL: {label} — {actual!r} scored {status!r}, want {want!r}")
+                return 1
+            print(f"ok: {label}")
+
+        # The widened tolerance must not leak onto other anchors.
+        for other, _fn, _sev, _d in ANCHORS:
+            if other != name and other in EQUIVALENT:
+                print(f"FAIL: unexpected EQUIVALENT entry for {other}")
+                return 1
+        print("ok: equivalence is scoped to the one anchor that needs it")
         return 0
     finally:
-        if backup is not None:
-            BASELINE_FILE.write_text(backup)
-        elif BASELINE_FILE.exists():
-            BASELINE_FILE.unlink()
+        STATE_DIR, BASELINE_FILE, RESULT_FILE, HISTORY_FILE = real_state
+        os.environ.pop("SENTINEL_STATE", None)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main() -> int:
