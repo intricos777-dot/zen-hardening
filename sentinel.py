@@ -362,12 +362,16 @@ def classify(name: str, expected, actual, sev: str) -> tuple[str, str, bool]:
 
     Returns (status, detail, is_drift).
     """
+    if name in ROOT_ONLY and str(actual).startswith(("unreadable", "unknown", "error")):
+        # A root-only control this run cannot read proves nothing about the
+        # current state, whatever the baseline recorded (which may have been
+        # captured under a higher-privileged account). Report it as unverified,
+        # never as drift: "cannot tell" is not the same as "changed".
+        return ("unverified",
+                "needs root to evaluate — run as root or with "
+                "CAP_SYS_ADMIN; currently unverifiable", False)
+
     if expected == actual:
-        if name in ROOT_ONLY and str(actual).startswith(("unreadable", "unknown", "error")):
-            # Matches its own unreadable baseline, but proves nothing.
-            return ("unverified",
-                    "needs root to evaluate — run as root or with "
-                    "CAP_SYS_ADMIN; currently unverifiable", False)
         return "ok", "matches baseline", False
 
     if actual in EQUIVALENT.get(name, ({}, ""))[0]:
@@ -480,10 +484,18 @@ def cmd_selftest(args) -> int:
             [sys.executable, __file__, "check", "--json"],
             capture_output=True, text=True).stdout)
         detected = payload["drift"]
-        if detected != len(ANCHORS):
-            print(f"FAIL: planted drift on all {len(ANCHORS)} anchors, detected {detected}")
+        # A root-only anchor this run cannot read is UNVERIFIED, never drift
+        # (an unreadable control proves nothing). Match that in the expected
+        # count instead of failing on the machine's own privilege boundary.
+        unver_here = {n for n in ROOT_ONLY
+                      if str(collect().get(n, "")).startswith(("unreadable", "unknown", "error"))}
+        expected_detect = len(ANCHORS) - len(unver_here)
+        if detected != expected_detect:
+            print(f"FAIL: planted drift on all {len(ANCHORS)} anchors, "
+                  f"detected {detected}, expected {expected_detect}")
             return 1
-        print(f"ok: planted drift on all {len(ANCHORS)} anchors, all {detected} detected")
+        print(f"ok: planted drift detected on {expected_detect}/{len(ANCHORS)} anchors "
+              f"({len(unver_here)} unreadable root-only anchor(s) reported unverified)")
 
         # And a matching baseline must produce zero drift.
         real = collect()
