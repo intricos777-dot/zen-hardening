@@ -47,7 +47,8 @@ SEV_ORDER = {"ok": 0, "unverified": 1, "warn": 2, "critical": 3}
 # because they merely match their own unreadable baseline would be a lie: a
 # critical control nobody can read is an UNVERIFIED control, not a passing
 # one. They are surfaced distinctly and excluded from the intact count.
-ROOT_ONLY = {"shadow-root-locked", "no-world-writable-etc", "sudo-requires-password"}
+ROOT_ONLY = {"shadow-root-locked", "no-world-writable-etc",
+             "sudo-requires-password", "no-empty-passwords"}
 
 # A baseline records what was true when it was captured. Most anchors assert a
 # property whose single recorded observation *is* the invariant, but some hold
@@ -79,12 +80,43 @@ EQUIVALENT = {
 
 # ------------------------------------------------------------------ helpers
 
-def _run(cmd: list[str], timeout: int = 30) -> tuple[int, str]:
+def _run(cmd: list[str], timeout: int = 30, env: dict | None = None) -> tuple[int, str]:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception as exc:
         return 127, str(exc)
+
+
+def _real_home() -> Path:
+    """Return the real user's home directory, even when run as root via sudo."""
+    if os.geteuid() == 0:
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user and sudo_user != "root":
+            import pwd
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+    return Path.home()
+
+
+def _systemctl_user(unit: str) -> str:
+    """Run systemctl --user as the real user, even when run as root."""
+    if os.geteuid() == 0:
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user and sudo_user != "root":
+            import pwd
+            pw = pwd.getpwnam(sudo_user)
+            uid = pw.pw_uid
+            runtime_dir = f"/run/user/{uid}"
+            bus = f"unix:path={runtime_dir}/bus"
+            env = dict(os.environ)
+            env["DBUS_SESSION_BUS_ADDRESS"] = bus
+            env["XDG_RUNTIME_DIR"] = runtime_dir
+            rc, out = _run(["setpriv", "--reuid", str(uid), "--regid", str(uid),
+                             "--init-groups", "--", "systemctl", "--user", "is-active", unit],
+                            env=env)
+            return out.strip().splitlines()[0] if out.strip() else "unknown"
+    rc, out = _run(["systemctl", "--user", "is-active", unit])
+    return out.strip().splitlines()[0] if out.strip() else "unknown"
 
 
 def _service_active(unit: str) -> str:
@@ -138,25 +170,62 @@ def a_sshd_permit_root() -> str:
     return "unknown"
 
 
-def a_faillock_admin_group() -> str:
-    """The single-admin policy: this must NOT be present until installed."""
+def _active_pam_lines(path: Path):
+    """Yield the lines of a PAM stack that are actually in effect.
+
+    A commented line is inert no matter what it names, so counting one as
+    active is how a monitor ends up reporting a control that is already gone.
+    A leading `-` (optional) still counts as active: it only means "do not fail
+    if the module is missing", not "do not run".
+    """
     try:
-        for line in Path("/etc/security/faillock.conf").read_text().splitlines():
-            if line.strip().startswith("admin_group"):
-                return line.split("=", 1)[1].strip()
+        text = path.read_text()
     except OSError:
-        return "unreadable"
-    return "unset"
+        return
+    for line in text.splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            yield line
 
 
-def a_faillock_unlock_time() -> str:
+def a_pam_no_nullok() -> str:
+    """nulllock: `nullok` is the single switch that lets an EMPTY password through.
+
+    fail2ban and firewalld do not cover this. pam_unix's `nullok` argument makes
+    an account whose shadow field is empty authenticate successfully with a
+    blank password, on every stack that carries it. This replaces the faillock
+    anchors, which asserted a lockout window that no longer exists: after
+    faillock was removed from every stack there is no counter left, so nulllock
+    is the whole of what remains on the authentication side.
+    """
+    hits = []
+    for path in sorted(Path("/etc/pam.d").glob("*")):
+        if not path.is_file():
+            continue
+        for line in _active_pam_lines(path):
+            if re.search(r"\bnullok\b", line):
+                hits.append(f"{path.name}:{line.strip()}")
+    return "none" if not hits else ";".join(hits[:5])
+
+
+def a_no_empty_passwords() -> str:
+    """No account may carry an empty password field.
+
+    This is the other half of nulllock. Stripping `nullok` stops an empty field
+    from being *honoured*; this stops one from existing in the first place. An
+    account with an empty field is a standing bypass for anything that reaches
+    PAM without `nullok` — a console, a custom stack, a service that builds its
+    own. Needs root: /etc/shadow is 0640 root:shadow.
+    """
     try:
-        for line in Path("/etc/security/faillock.conf").read_text().splitlines():
-            if line.strip().startswith("unlock_time"):
-                return line.split("=", 1)[1].strip()
+        text = Path("/etc/shadow").read_text()
     except OSError:
         return "unreadable"
-    return "unset"
+    empty = []
+    for line in text.splitlines():
+        parts = line.split(":")
+        if len(parts) > 1 and parts[1] == "":
+            empty.append(parts[0])
+    return "none" if not empty else ";".join(sorted(empty)[:5])
 
 
 def a_shadow_root_locked() -> str:
@@ -214,7 +283,7 @@ def a_collector_localhost_only() -> str:
 
 
 def a_collector_token_perms() -> str:
-    p = Path.home() / ".lia-cli/inbox/token"
+    p = _real_home() / ".lia-cli/inbox/token"
     if not p.exists():
         return "absent"
     return oct(p.stat().st_mode & 0o777)
@@ -231,14 +300,14 @@ def a_collector_healthy() -> str:
 
 
 def a_shield_kitty_active() -> str:
-    rc, out = _run(["systemctl", "--user", "is-active", "shield-kitty-watch.service"])
-    return out.strip() or "unknown"
+    return _systemctl_user("shield-kitty-watch.service")
 
 
 def a_evidence_chain_intact() -> str:
     """The forensic chain must still verify; this is the tamper tripwire."""
-    ev = Path.home() / ".local/share/shield-kitty/evidence/chain.jsonl"
-    script = Path.home() / "Projects/shield-kitty-forensics/evidence.py"
+    home = _real_home()
+    ev = home / ".local/share/shield-kitty/evidence/chain.jsonl"
+    script = home / "Projects/shield-kitty-forensics/evidence.py"
     if not ev.exists() or not script.exists():
         return "unavailable"
     rc, out = _run([sys.executable, str(script), "verify"], timeout=90)
@@ -270,16 +339,16 @@ def a_self_healer_alive() -> str:
     ever started them. Silent, and invisible to a monitor that only watches
     security posture.
     """
-    rc, out = _run(["systemctl", "--user", "is-active", "bhm-self-watchdog.service"])
-    return out.strip() or "unknown"
+    return _systemctl_user("bhm-self-watchdog.service")
 
 
 def a_healer_state_writable() -> str:
     """The healer must be able to write its own log, or it fails silently."""
-    d = Path.home() / ".local/state/kernel-healer"
+    d = _real_home() / ".local/state/kernel-healer"
     probe = d / ".write-probe"
     try:
-        d.mkdir(parents=True, exist_ok=True)
+        if not d.exists():
+            return "unwritable:FileNotFoundError"
         probe.write_text("ok")
         probe.unlink()
         return "writable"
@@ -298,11 +367,12 @@ ANCHORS = [
      "An open :22 contradicts 'sshd disabled' and means a remote login path exists."),
     ("sshd-permit-root", a_sshd_permit_root, "warn",
      "Records the effective sshd root-login policy. Informational while sshd is off."),
-    ("faillock-admin-group", a_faillock_admin_group, "warn",
-     "Single-admin policy. 'unset' means the primary user is NOT exempt yet "
-     "(install-faillock-admin.sh has not been run)."),
-    ("faillock-unlock-time", a_faillock_unlock_time, "warn",
-     "Live lockout window. The hardened policy is 1800s; 30 is the stock default."),
+    ("pam-no-nullok", a_pam_no_nullok, "critical",
+     "nulllock: an active `nullok` anywhere in /etc/pam.d lets an EMPTY "
+     "password authenticate. This is the control that replaced faillock."),
+    ("no-empty-passwords", a_no_empty_passwords, "critical",
+     "An account with an empty /etc/shadow field is a standing bypass for any "
+     "stack that reaches PAM without `nullok`. The other half of nulllock."),
     ("shadow-root-locked", a_shadow_root_locked, "critical",
      "A password on root defeats most of the hardening here."),
     ("sudo-requires-password", a_sudo_requires_password, "critical",
@@ -362,11 +432,22 @@ def classify(name: str, expected, actual, sev: str) -> tuple[str, str, bool]:
 
     Returns (status, detail, is_drift).
     """
+    # A caller who lacks the privilege to evaluate a ROOT_ONLY anchor has not
+    # observed a change in the system — it has observed its own lack of access.
+    # Scoring that as drift invents a security regression, and it does so
+    # whenever the baseline was captured at a different privilege than the check
+    # runs at. Captured as root ("locked") and checked as the operator
+    # ("unreadable") is exactly that pair: the two strings differ because the
+    # reader changed, not because /etc/shadow changed, and it kept reporting
+    # CRITICAL after root's password had genuinely been locked.
+    #
+    # So this is decided before the equality test and without consulting the
+    # baseline. "unverified" is the honest verdict — the file's own rule is that
+    # a critical control nobody can read is unverified, not passing — and
+    # cmd_check already exits 3 for it, so the gap stays visible rather than
+    # being either hidden or dramatised. Root runs are unaffected: a real
+    # "SET" against a "locked" baseline still reads as drift.
     if name in ROOT_ONLY and str(actual).startswith(("unreadable", "unknown", "error")):
-        # A root-only control this run cannot read proves nothing about the
-        # current state, whatever the baseline recorded (which may have been
-        # captured under a higher-privileged account). Report it as unverified,
-        # never as drift: "cannot tell" is not the same as "changed".
         return ("unverified",
                 "needs root to evaluate — run as root or with "
                 "CAP_SYS_ADMIN; currently unverifiable", False)
@@ -476,6 +557,15 @@ def cmd_selftest(args) -> int:
         RESULT_FILE = STATE_DIR / "last-result.json"
         HISTORY_FILE = STATE_DIR / "history.jsonl"
         os.environ["SENTINEL_STATE"] = str(STATE_DIR)
+        live = collect()
+        # Anchors this caller has no privilege to read. A planted baseline must
+        # not turn those into drift: "unreadable" carries no information about
+        # system state, so no comparison against it can show a change. They are
+        # asserted separately below, as unverified.
+        denied = {
+            n for n, v in live.items()
+            if n in ROOT_ONLY and str(v).startswith(("unreadable", "unknown", "error"))
+        }
         BASELINE_FILE.write_text(json.dumps({
             "captured_at": "test", "host": "t", "user": "t",
             "values": {n: "PLANTED" for n, _f, _s, _d in ANCHORS},
@@ -484,21 +574,30 @@ def cmd_selftest(args) -> int:
             [sys.executable, __file__, "check", "--json"],
             capture_output=True, text=True).stdout)
         detected = payload["drift"]
-        # A root-only anchor this run cannot read is UNVERIFIED, never drift
-        # (an unreadable control proves nothing). Match that in the expected
-        # count instead of failing on the machine's own privilege boundary.
-        unver_here = {n for n in ROOT_ONLY
-                      if str(collect().get(n, "")).startswith(("unreadable", "unknown", "error"))}
-        expected_detect = len(ANCHORS) - len(unver_here)
-        if detected != expected_detect:
+        want = len(ANCHORS) - len(denied)
+        if detected != want:
             print(f"FAIL: planted drift on all {len(ANCHORS)} anchors, "
-                  f"detected {detected}, expected {expected_detect}")
+                  f"detected {detected}, expected {want}")
+            for r in payload["results"]:
+                if r["status"] not in ("ok", "unverified"):
+                    print(f"   undetected: {r['anchor']}: {r['detail']}")
             return 1
-        print(f"ok: planted drift detected on {expected_detect}/{len(ANCHORS)} anchors "
-              f"({len(unver_here)} unreadable root-only anchor(s) reported unverified)")
+        print(f"ok: planted drift detected on all {want} evaluable anchors")
+
+        # An anchor this caller cannot read must come back unverified. Not
+        # drift — being unable to look proves no change — and not ok either, or
+        # a critical control nobody can read would read as a passing one.
+        for r in payload["results"]:
+            if r["anchor"] in denied and r["status"] != "unverified":
+                print(f"FAIL: {r['anchor']} observed {r['actual']!r} scored "
+                      f"{r['status']!r}, want 'unverified'")
+                return 1
+        if denied:
+            print(f"ok: {len(denied)} unreadable anchor(s) reported unverified, "
+                  f"neither drift nor ok: {', '.join(sorted(denied))}")
 
         # And a matching baseline must produce zero drift.
-        real = collect()
+        real = live
         BASELINE_FILE.write_text(json.dumps(
             {"captured_at": "test", "host": "t", "user": "t", "values": real}))
         payload = json.loads(subprocess.run(
@@ -536,6 +635,41 @@ def cmd_selftest(args) -> int:
                 print(f"FAIL: unexpected EQUIVALENT entry for {other}")
                 return 1
         print("ok: equivalence is scoped to the one anchor that needs it")
+
+        # The pair that had this reporting CRITICAL for days: a baseline
+        # captured as root records "locked", and the operator's own check reads
+        # "unreadable". The reader changed, not /etc/shadow. A genuine "SET"
+        # against a "locked" baseline must still be drift, or the exemption
+        # would have blinded the anchor rather than quieted it.
+        for expected, actual, want in (
+            ("locked", "unreadable", "unverified"),
+            ("unreadable", "unreadable", "unverified"),
+            ("locked", "locked", "ok"),
+            ("locked", "SET", "critical"),
+            ("SET", "locked", "critical"),
+        ):
+            status, _why, is_drift = classify(
+                "shadow-root-locked", expected, actual, "critical")
+            want_drift = want == "critical"
+            if status != want or is_drift != want_drift:
+                print(f"FAIL: shadow-root-locked expected={expected!r} "
+                      f"actual={actual!r} -> {status!r}/drift={is_drift}, "
+                      f"want {want!r}/drift={want_drift}")
+                return 1
+            print(f"ok: shadow-root-locked expected={expected!r} "
+                  f"actual={actual!r} -> {want}")
+
+        # The same privilege rule must not extend to anchors any user can read,
+        # or it would excuse real regressions there.
+        for other in ("firewalld-active", "collector-healthy"):
+            if other in ROOT_ONLY:
+                print(f"FAIL: {other} should not be ROOT_ONLY")
+                return 1
+            status, _why, is_drift = classify(other, "active", "unreadable", "critical")
+            if status == "unverified" or not is_drift:
+                print(f"FAIL: {other} excused a real drift as {status!r}")
+                return 1
+        print("ok: privilege exemption does not extend to readable anchors")
         return 0
     finally:
         STATE_DIR, BASELINE_FILE, RESULT_FILE, HISTORY_FILE = real_state
