@@ -1,5 +1,8 @@
 #!/bin/bash
 # Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
+# Copyright (c) 2026 Living Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
+# Licensed under Living Sin Proprietary License (LSPL-1.0)
+# See LICENSE file for details.
 # enroll-admin.sh — manage membership of the shield-admin group.
 #
 # shield-admin is the pam_faillock admin_group. Members of it are NEVER locked
