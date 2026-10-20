@@ -1,3 +1,4 @@
+<!-- Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work -->
 # Root recovery — this machine
 
 Three different failures need three different answers. Pick by symptom.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # git-verified.sh -- run a git command and report its REAL exit status.
 #
 # WHY THIS EXISTS

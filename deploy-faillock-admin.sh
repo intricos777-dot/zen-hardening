@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # deploy-faillock-admin.sh — make `livings` the only account that pam_faillock
 # will never lock out.
 #

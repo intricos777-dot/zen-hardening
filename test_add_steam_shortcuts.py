@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 """Tests for the binary shortcuts.vdf reader/writer.
 
 The reader and writer are hand-rolled against an undocumented binary format,

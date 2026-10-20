@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # arpwatch-spoof-scan.sh — detect ARP spoofing from arpwatch's datafile.
 #
 # WHY THIS EXISTS INSTEAD OF AN EXEC HOOK

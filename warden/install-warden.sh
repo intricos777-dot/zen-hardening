@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # install-warden.sh — install the nft chain, config, systemd units and sudo
 # helper for the warden auto-blacklister.
 #

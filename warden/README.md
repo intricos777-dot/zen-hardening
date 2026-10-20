@@ -1,3 +1,4 @@
+<!-- Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work -->
 # warden — auto-blacklist PCs and phones that connect to this box
 
 Two tools, built on 2026-09-26.

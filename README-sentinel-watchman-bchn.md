@@ -1,3 +1,4 @@
+<!-- Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work -->
 # sentinel / watchman / bchn-monitor
 
 Rebuilt 2026-09-26. None of these three existed in any repository or in any

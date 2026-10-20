@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # fix-sudoers-permissions.sh — resolve the "bad permissions" warnings without
 # accidentally activating an unreviewed privilege grant.
 #

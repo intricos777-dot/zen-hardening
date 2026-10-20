@@ -1,3 +1,4 @@
+<!-- Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work -->
 # fail2ban coverage — what is actually enforced, and what is not
 
 Verified on this machine, 2026-09-26. Read this before assuming you are

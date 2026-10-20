@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # repair-root-access.sh — restore root/sudo access on this host.
 #
 # Run it as uid 0, from EITHER:

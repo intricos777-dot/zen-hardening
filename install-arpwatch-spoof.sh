@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # install-arpwatch-spoof.sh — deploy local ARP spoof detection.
 #
 # Installs arpwatch wired to the Shield Kitty notifier, on wlo1. Everything

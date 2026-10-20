@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 #
 # agent-guard.sh — keep the AI agents current, and watch their code for
 #                  insecure patterns. Detect by default; update only on request.

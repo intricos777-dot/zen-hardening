@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # recover-root-chroot.sh — regain root from inside a chroot on a live USB.
 #
 #   pkexec bash ~/Projects/zen-hardening/RECOVER-SUDO.sh    # sudo broken, password KNOWN

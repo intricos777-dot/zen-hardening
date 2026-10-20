@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # RECOVER-SUDO.sh — restore sudo after a sudoers mishap, and install the
 # audit helpers. Safe to run more than once. Deletes nothing.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # remove-remote-viewing.sh — find, remove, and block remote-viewing /
 # remote-control applications, TeamViewer first.
 #

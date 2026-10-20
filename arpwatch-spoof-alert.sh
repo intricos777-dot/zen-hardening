@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # arpwatch-spoof-alert.sh — arpwatch(8) exec hook for local spoof detection.
 #
 # arpwatch is told to exec this instead of mailing. arpwatch calls it as:

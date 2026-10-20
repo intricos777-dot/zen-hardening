@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # preflight.sh — is this machine ready to reboot?
 #
 # Read-only. Changes nothing, needs no root for most checks (root-only checks

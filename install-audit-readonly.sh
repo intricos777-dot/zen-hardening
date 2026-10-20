@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # install-audit-readonly.sh — install narrowly scoped, read-only audit helpers.
 #
 #   sudo bash install-audit-readonly.sh

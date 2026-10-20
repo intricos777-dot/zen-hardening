@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # block-remote-viewing.sh — drop every known remote-viewing / remote-access
 # application at the firewall.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 """Add non-Steam game shortcuts to Steam's shortcuts.vdf.
 
 Steam keeps non-Steam shortcuts in a BINARY vdf at

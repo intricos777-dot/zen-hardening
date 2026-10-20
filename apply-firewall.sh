@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # apply-firewall.sh — install and activate the strict workstation zone.
 #
 # Idempotent. Safe to re-run. Run as root:

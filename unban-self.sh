@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # unban-self.sh — remove fail2ban bans against YOUR OWN current addresses.
 #
 # WHY THIS EXISTS

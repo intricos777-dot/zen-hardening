@@ -1,3 +1,4 @@
+<!-- Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work -->
 # stray test artifacts
 
 `false.new` and `true.new` are zero-byte files that got committed in

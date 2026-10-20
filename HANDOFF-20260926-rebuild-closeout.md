@@ -1,3 +1,4 @@
+<!-- Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work -->
 # Handoff — 2026-09-26 system rebuild closeout
 
 Written by Hermes at the user's request, to brief a fresh OpenCode session.

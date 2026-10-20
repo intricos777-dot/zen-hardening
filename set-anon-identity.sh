@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # set-anon-identity.sh — present as "zero" on every network and interface.
 #
 # Idempotent. Safe to re-run. Designed to be re-applied after a rebuild.

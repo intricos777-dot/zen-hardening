@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 #
 # auto-patch.sh — apply a NARROW set of provably-safer fixes to agent source,
 #                 and surface everything else for human review.

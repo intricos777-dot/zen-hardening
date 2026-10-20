@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # install-shield-kitty-units.sh — install Shield Kitty's systemd units so the
 # watcher and evidence sealer survive a reboot.
 #

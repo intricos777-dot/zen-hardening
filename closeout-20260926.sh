@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # Close out the four loose ends from the 2026-09-26 hardening audit.
 # Run as:  sudo bash ~/Projects/zen-hardening/closeout-20260926.sh
 #

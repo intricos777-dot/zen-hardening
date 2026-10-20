@@ -1,4 +1,5 @@
 #!/bin/bash
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # install-faillock-admin.sh — apply the single-admin faillock policy.
 #
 #   sudo ./install-faillock-admin.sh
